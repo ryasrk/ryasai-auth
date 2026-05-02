@@ -1,0 +1,18 @@
+# ── ryasai-auth dependencies ─────────────────────────────────────
+# Browser automation
+camoufox[geoip]==0.4.11
+playwright==1.58.0
+
+# HTTP client (server communication)
+httpx>=0.28.0
+
+# HTTP sessions (provider auth flows)
+aiohttp>=3.9.0
+aiohttp-socks>=0.9.0
+
+# Config
+pydantic>=2.0.0,<3.0.0
+pydantic-settings>=2.0.0,<3.0.0
+
+# Rich CLI output
+rich>=13.0.0
