@@ -93,7 +93,7 @@ ok "All Python packages installed"
 step "4/5 — Camoufox Browser + Playwright"
 
 # System deps for headless browser (optional but recommended)
-SYSTEM_DEPS="libatk-bridge2.0-0 libatk1.0-0 libcups2 libglib2.0-0 libgtk-3-0 libnspr4 libnss3 libxcomposite1 libxdamage1 libxrandr2 xvfb"
+SYSTEM_DEPS="libasound2 libatk-bridge2.0-0 libatk1.0-0 libcups2 libdbus-glib-1-2 libglib2.0-0 libgtk-3-0 libnspr4 libnss3 libx11-xcb1 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libxtst6 xvfb"
 if command -v apt-get &>/dev/null; then
     info "Installing browser system dependencies..."
     if [[ $EUID -eq 0 ]]; then
