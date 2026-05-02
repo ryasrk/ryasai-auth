@@ -34,7 +34,13 @@ class AuthSettings(BaseSettings):
 
     # ── Worker ───────────────────────────────────────────────────
     worker_id: str = Field(default="", alias="WORKER_ID")
-    concurrency: int = Field(default=2, alias="CONCURRENCY")
+    concurrency: int = Field(default=1, alias="CONCURRENCY")
+
+    # ── Anti-Ban / Isolation ─────────────────────────────────────
+    # Delay (seconds) between finishing one account and starting the next
+    account_delay: float = Field(default=5.0, alias="ACCOUNT_DELAY")
+    # Random jitter added to delay (0 to this value)
+    account_delay_jitter: float = Field(default=3.0, alias="ACCOUNT_DELAY_JITTER")
 
     # ── Browser ──────────────────────────────────────────────────
     camoufox_headless: str = Field(default="true", alias="CAMOUFOX_HEADLESS")
