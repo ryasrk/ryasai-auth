@@ -35,6 +35,8 @@ class AuthSettings(BaseSettings):
     # ── Worker ───────────────────────────────────────────────────
     worker_id: str = Field(default="", alias="WORKER_ID")
     concurrency: int = Field(default=1, alias="CONCURRENCY")
+    # True = run N accounts in parallel; False = sequential (1 at a time)
+    parallel: bool = Field(default=True, alias="PARALLEL")
 
     # ── Anti-Ban / Isolation ─────────────────────────────────────
     # Delay (seconds) between finishing one account and starting the next

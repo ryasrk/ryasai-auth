@@ -366,22 +366,18 @@ async def local_login(
 ):
     """Run browser login locally and push results to the server.
 
-    Anti-ban strategy: 1 account = 1 isolated browser session.
-    Each account is processed sequentially (or with limited concurrency)
-    with a configurable delay + jitter between accounts to mimic human behavior.
+    Two modes controlled by PARALLEL setting:
+      - PARALLEL=true:  Run N accounts simultaneously (fast, uses more RAM)
+      - PARALLEL=false: Run accounts one-by-one with delay (anti-ban safe)
 
-    Flow per account:
-      1. Launch fresh Camoufox browser (new fingerprint)
-      2. Login to all providers for this account
-      3. Close browser completely
-      4. Wait delay + random jitter
-      5. Next account
+    Each account always gets its own isolated Camoufox browser instance.
     """
     import random
 
     import api_client
     from login_runner import run_login
 
+    parallel = settings.parallel
     account_delay = settings.account_delay
     account_jitter = settings.account_delay_jitter
 
@@ -404,58 +400,48 @@ async def local_login(
         except Exception as e:
             logger.warning("  Failed to register chunk: %s (continuing anyway)", e)
 
-    # Step 3: Run login — 1 account 1 browser (sequential isolation)
+    # Step 3: Run login
     total = len(accounts) * len(providers)
     logger.info(
         "🔑 Starting login: %d accounts × %d providers = %d jobs",
         len(accounts), len(providers), total,
     )
-    logger.info(
-        "🛡️  Anti-ban mode: 1 account = 1 browser, delay=%.1fs (+jitter %.1fs)",
-        account_delay, account_jitter,
-    )
-    if concurrent > 1:
+
+    if parallel:
         logger.info(
-            "   Concurrency=%d (parallel providers per account, NOT parallel accounts)",
-            concurrent,
+            "⚡ PARALLEL mode: %d accounts at once (concurrency=%d)",
+            min(concurrent, len(accounts)), concurrent,
+        )
+    else:
+        logger.info(
+            "🛡️  SEQUENTIAL mode: 1 account at a time, delay=%.1fs (+jitter %.1fs)",
+            account_delay, account_jitter,
         )
 
     success = 0
     failed = 0
     skipped = 0
     results_buffer: list[dict] = []
-    account_num = 0
+    lock = asyncio.Lock()
 
-    for acc in accounts:
-        if not _running:
-            skipped += (len(accounts) - account_num) * len(providers)
-            break
-
-        account_num += 1
+    async def _login_account(acc_idx: int, acc: dict):
+        """Login a single account to all its providers."""
+        nonlocal success, failed
         email = acc["email"]
         password = acc["password"]
 
-        logger.info("")
-        logger.info(
-            "━━━ [%d/%d] %s ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-            account_num, len(accounts), email,
-        )
+        logger.info("  🚀 [%d/%d] %s", acc_idx, len(accounts), email)
 
-        # Process all providers for this account
-        # If concurrent > 1, run providers in parallel for the SAME account
-        # (still 1 browser per provider call — each provider gets its own browser)
-        semaphore = asyncio.Semaphore(concurrent)
+        for prov in providers:
+            if not _running:
+                return
 
-        async def _login_provider(prov: str):
-            nonlocal success, failed
-            async with semaphore:
-                if not _running:
-                    return
-                result = await run_login(
-                    email, password, prov,
-                    headless=headless, proxy_url=proxy_url,
-                )
+            result = await run_login(
+                email, password, prov,
+                headless=headless, proxy_url=proxy_url,
+            )
 
+            async with lock:
                 if result["status"] == "success":
                     success += 1
                     logger.info(
@@ -470,44 +456,71 @@ async def local_login(
                         email, prov, result.get("error", "unknown"),
                     )
 
-                # Push result to server immediately
-                try:
-                    await api_client.push_result(result)
-                except Exception as e:
-                    logger.warning("  Failed to push result: %s (buffering)", e)
+            # Push result to server immediately
+            try:
+                await api_client.push_result(result)
+            except Exception as e:
+                logger.warning("  Failed to push result: %s (buffering)", e)
+                async with lock:
                     results_buffer.append(result)
 
-        # Run providers for this account (sequentially if concurrent=1)
-        if concurrent <= 1:
-            # Strictly sequential: 1 browser at a time
-            for prov in providers:
+    # ── PARALLEL MODE: run N accounts concurrently ───────────────
+    if parallel:
+        semaphore = asyncio.Semaphore(concurrent)
+
+        async def _throttled_login(idx: int, acc: dict):
+            async with semaphore:
                 if not _running:
-                    skipped += 1
-                    continue
-                await _login_provider(prov)
-        else:
-            # Parallel providers for same account (still isolated browsers)
-            tasks = [asyncio.create_task(_login_provider(prov)) for prov in providers]
-            for t in tasks:
-                _active_tasks.add(t)
-                t.add_done_callback(_active_tasks.discard)
-            await asyncio.gather(*tasks, return_exceptions=True)
+                    return
+                await _login_account(idx, acc)
 
-        # Progress
-        done_jobs = success + failed
-        logger.info(
-            "  📊 Progress: %d/%d accounts, %d/%d jobs (✅ %d, ❌ %d)",
-            account_num, len(accounts), done_jobs, total, success, failed,
-        )
+        tasks = [
+            asyncio.create_task(_throttled_login(i + 1, acc))
+            for i, acc in enumerate(accounts)
+        ]
+        for t in tasks:
+            _active_tasks.add(t)
+            t.add_done_callback(_active_tasks.discard)
 
-        # Anti-ban delay between accounts (skip if last account or shutting down)
-        if _running and account_num < len(accounts):
-            delay = account_delay + random.uniform(0, account_jitter)
-            logger.info("  ⏳ Cooling down %.1fs before next account...", delay)
+        # Wait with progress reporting
+        done_count = 0
+        for coro in asyncio.as_completed(tasks):
             try:
-                await asyncio.wait_for(_shutdown_event.wait(), timeout=delay)
-            except asyncio.TimeoutError:
-                pass  # Normal — timeout means delay completed
+                await coro
+            except asyncio.CancelledError:
+                skipped += len(providers)
+            except Exception as e:
+                logger.error("  Unexpected error: %s", e)
+            done_count += 1
+            if done_count % 5 == 0 or done_count == len(accounts):
+                logger.info(
+                    "  📊 Progress: %d/%d accounts done (✅ %d, ❌ %d)",
+                    done_count, len(accounts), success, failed,
+                )
+
+    # ── SEQUENTIAL MODE: 1 account at a time with delay ──────────
+    else:
+        for acc_idx, acc in enumerate(accounts, 1):
+            if not _running:
+                skipped += (len(accounts) - acc_idx + 1) * len(providers)
+                break
+
+            await _login_account(acc_idx, acc)
+
+            # Progress
+            logger.info(
+                "  📊 Progress: %d/%d accounts, %d/%d jobs (✅ %d, ❌ %d)",
+                acc_idx, len(accounts), success + failed, total, success, failed,
+            )
+
+            # Anti-ban delay between accounts
+            if _running and acc_idx < len(accounts):
+                delay = account_delay + random.uniform(0, account_jitter)
+                logger.info("  ⏳ Cooling down %.1fs before next account...", delay)
+                try:
+                    await asyncio.wait_for(_shutdown_event.wait(), timeout=delay)
+                except asyncio.TimeoutError:
+                    pass
 
     # Flush buffered results
     if results_buffer:
@@ -527,7 +540,7 @@ async def local_login(
     if skipped:
         logger.info("  ⏭️  Skipped:  %d (shutdown)", skipped)
     logger.info("  📊 Total:    %d/%d", success + failed, total)
-    logger.info("  🛡️  Mode:    1 account = 1 browser (isolated)")
+    logger.info("  ⚡ Mode:     %s (concurrency=%d)", "PARALLEL" if parallel else "SEQUENTIAL", concurrent)
     if not _running:
         logger.info("  ⚠️  Stopped early due to shutdown signal")
     logger.info("")
@@ -561,8 +574,8 @@ async def main(args):
     # ── CONSUME MODE: no accounts file needed ────────────────────
     if args.consume:
         logger.info("  Mode:       consume (pull from server queue)")
-        logger.info("  Isolation:  🛡️  1 account = 1 browser")
-        logger.info("  Delay:      %.1fs + jitter %.1fs", settings.account_delay, settings.account_delay_jitter)
+        logger.info("  Parallel:   %s", "⚡ YES" if settings.parallel else "🛡️ NO (sequential)")
+        logger.info("  Concurrency: %d", concurrent)
         logger.info("  Poll:       %ds", args.poll_interval)
         logger.info("")
         await consume(providers, concurrent, headless, proxy_url, args.poll_interval)
@@ -586,10 +599,10 @@ async def main(args):
         await store(accounts, providers)
     else:
         logger.info("  Mode:       local-login (login here, push tokens)")
-        logger.info("  Isolation:  🛡️  1 account = 1 browser")
-        logger.info("  Delay:      %.1fs + jitter %.1fs", settings.account_delay, settings.account_delay_jitter)
-        if concurrent > 1:
-            logger.info("  Concurrency: %d (parallel providers per account)", concurrent)
+        logger.info("  Parallel:   %s", "⚡ YES" if settings.parallel else "🛡️ NO (sequential)")
+        logger.info("  Concurrency: %d", concurrent)
+        if not settings.parallel:
+            logger.info("  Delay:      %.1fs + jitter %.1fs", settings.account_delay, settings.account_delay_jitter)
         logger.info("")
         await local_login(accounts, providers, concurrent, headless, proxy_url)
 
