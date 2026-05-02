@@ -29,6 +29,7 @@ import argparse
 import asyncio
 import logging
 import os
+import resource
 import signal
 import sys
 import time
@@ -38,6 +39,14 @@ from pathlib import Path
 from config import get_settings
 
 settings = get_settings()
+
+# ── Bump file descriptor limit (browsers need many fds) ──────────
+try:
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft < 65536:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (min(65536, hard), hard))
+except (ValueError, OSError):
+    pass
 
 # ── Logging ──────────────────────────────────────────────────────
 logging.basicConfig(
