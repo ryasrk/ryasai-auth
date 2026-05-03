@@ -400,12 +400,16 @@ async def local_login(
         logger.error("❌ Server connection failed: %s", e)
         return
 
-    # Step 2: Push accounts to server (store + queue)
-    logger.info("📤 Registering %d accounts on server...", len(accounts))
+    # Step 2: Push accounts to server (store only — no Redis queue)
+    # We process accounts locally, so don't queue them for remote consumers.
+    # This prevents double-processing if a --consume worker is also running.
+    logger.info("📤 Registering %d accounts on server (store_only=true)...", len(accounts))
     for i in range(0, len(accounts), 50):
         chunk = accounts[i:i + 50]
         try:
-            await api_client.push_accounts(chunk, providers=providers)
+            await api_client.push_accounts(
+                chunk, providers=providers, store_only=True,
+            )
         except Exception as e:
             logger.warning("  Failed to register chunk: %s (continuing anyway)", e)
 

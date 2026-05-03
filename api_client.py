@@ -61,17 +61,22 @@ async def push_accounts(
     *,
     providers: list[str] | None = None,
     concurrent: int = 2,
+    store_only: bool = False,
 ) -> dict[str, Any]:
-    """Push accounts to the server (stored in DB + queued for login).
+    """Push accounts to the server.
 
-    All accounts go to POST /api/worker/accounts which now always
-    stores AND queues. A consumer (server-local or remote --consume)
-    will pick them up.
+    Args:
+        accounts: List of {"email": ..., "password": ...} dicts.
+        providers: Provider list for login.
+        concurrent: Max concurrent logins.
+        store_only: If True, store in DB but do NOT push to Redis queue.
+                    Used by local-login mode (we process accounts ourselves).
     """
     client = _get_client()
     payload: dict[str, Any] = {
         "accounts": accounts,
         "concurrent": concurrent,
+        "store_only": store_only,
     }
     if providers:
         payload["providers"] = providers
