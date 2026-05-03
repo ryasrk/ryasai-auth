@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """ryasai-auth — Standalone auth agent for ryasai.
 
-Three modes:
+Four modes:
   1. LOCAL LOGIN (default):  Read accounts.txt → login on this PC → push tokens to server
   2. STORE ONLY (--store):   Read accounts.txt → push to server queue → done
   3. CONSUME (--consume):    Pull queued accounts from server → login here → push tokens back
+  4. RETRY (--retry):        Re-login previously failed accounts from local store
 
 Usage:
     # Login accounts from file and push to server
@@ -15,6 +16,12 @@ Usage:
 
     # Pull queued accounts from server, login here, push results back
     python ryasai_auth.py --consume
+
+    # Retry all previously failed accounts
+    python ryasai_auth.py --retry
+
+    # Clear the failed accounts store
+    python ryasai_auth.py --retry-clear
 
     # Custom providers
     python ryasai_auth.py accounts.txt --providers kiro,wavespeed
@@ -210,6 +217,7 @@ async def consume(
     The server decrypts passwords before sending them to us.
     """
     import api_client
+    import failed_store
     from login_runner import run_login
 
     # Check server
@@ -305,11 +313,16 @@ async def consume(
                 if result["status"] == "success":
                     total_success += 1
                     logger.info("  ✅ %s/%s — success", email, provider)
+                    await failed_store.remove_succeeded(email, provider)
                 else:
                     total_failed += 1
                     logger.error(
                         "  ❌ %s/%s — %s",
                         email, provider, result.get("error", "unknown"),
+                    )
+                    await failed_store.save_failed(
+                        email, password, provider,
+                        result.get("error", "unknown"),
                     )
 
                 # Push result immediately
@@ -384,6 +397,7 @@ async def local_login(
     import random
 
     import api_client
+    import failed_store
     from login_runner import run_login
 
     parallel = settings.parallel
@@ -462,11 +476,18 @@ async def local_login(
                         email, prov,
                         ", ".join(result.get("tokens", {}).keys()) if result.get("tokens") else "none",
                     )
+                    # Remove from failed store if it was a retry
+                    await failed_store.remove_succeeded(email, prov)
                 else:
                     failed += 1
                     logger.error(
                         "  ❌ %s/%s — %s",
                         email, prov, result.get("error", "unknown"),
+                    )
+                    # Save to local failed store for --retry
+                    await failed_store.save_failed(
+                        email, password, prov,
+                        result.get("error", "unknown"),
                     )
 
             # Push result to server immediately
@@ -562,6 +583,95 @@ async def local_login(
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  MODE 4: RETRY (re-login previously failed accounts)
+# ═══════════════════════════════════════════════════════════════════
+
+async def retry(
+    providers: list[str] | None,
+    concurrent: int,
+    headless: str,
+    proxy_url: str,
+):
+    """Retry all previously failed accounts from the local store.
+
+    Loads accounts from ~/.ryasai-auth/failed_accounts.json,
+    groups them by email (so each email is logged in once per provider),
+    and runs them through local_login.
+
+    Successfully retried accounts are removed from the failed store.
+    Still-failing accounts stay in the store with updated attempt count.
+    """
+    import failed_store
+
+    entries = await failed_store.load_failed()
+    if not entries:
+        logger.info("✅ No failed accounts to retry!")
+        logger.info("   Store: %s", failed_store.get_store_path())
+        return
+
+    # Group by email → collect unique email:password + per-email providers
+    email_map: dict[str, dict] = {}  # email → {"password": ..., "providers": set(...)}
+    for entry in entries:
+        email = entry["email"]
+        if email not in email_map:
+            email_map[email] = {
+                "password": entry["password"],
+                "providers": set(),
+            }
+        email_map[email]["providers"].add(entry["provider"])
+        # Always use the latest password
+        email_map[email]["password"] = entry["password"]
+
+    # If --providers was specified, filter to only those providers
+    if providers:
+        provider_set = set(providers)
+        for email in list(email_map.keys()):
+            email_map[email]["providers"] &= provider_set
+            if not email_map[email]["providers"]:
+                del email_map[email]
+
+    if not email_map:
+        logger.info("✅ No failed accounts match the specified providers")
+        return
+
+    # Build accounts list and per-account provider lists
+    accounts = []
+    retry_providers_map: dict[str, list[str]] = {}  # email → [providers]
+    for email, info in email_map.items():
+        accounts.append({"email": email, "password": info["password"]})
+        retry_providers_map[email] = sorted(info["providers"])
+
+    # Collect all unique providers across all accounts
+    all_providers = sorted(set(p for plist in retry_providers_map.values() for p in plist))
+
+    total_jobs = sum(len(plist) for plist in retry_providers_map.values())
+    logger.info("🔄 Retrying %d failed accounts (%d jobs)", len(accounts), total_jobs)
+    logger.info("   Providers: %s", ", ".join(all_providers))
+    logger.info("   Store: %s", failed_store.get_store_path())
+    logger.info("")
+
+    for entry in entries:
+        logger.info(
+            "   • %s/%s — %s (attempts: %d)",
+            entry["email"], entry["provider"],
+            entry.get("error", "?")[:60],
+            entry.get("attempts", 1),
+        )
+    logger.info("")
+
+    # Use local_login with the collected providers
+    # local_login already hooks into failed_store (save on fail, remove on success)
+    await local_login(accounts, all_providers, concurrent, headless, proxy_url)
+
+    # Report remaining failures
+    remaining = await failed_store.load_failed()
+    if remaining:
+        logger.info("⚠️  %d accounts still failing (saved for next --retry)", len(remaining))
+    else:
+        logger.info("🎉 All accounts succeeded! Failed store is now empty.")
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  MAIN
 # ═══════════════════════════════════════════════════════════════════
 
@@ -583,6 +693,25 @@ async def main(args):
     logger.info("╚══════════════════════════════════════════════════╝")
     logger.info("  Server:     %s", settings.server_url)
     logger.info("  Providers:  %s", ", ".join(providers))
+
+    # ── RETRY-CLEAR: just wipe the failed store ─────────────────
+    if args.retry_clear:
+        import failed_store
+        count = failed_store.count_sync()
+        await failed_store.clear_all()
+        logger.info("🗑️  Cleared %d failed accounts from %s", count, failed_store.get_store_path())
+        return
+
+    # ── RETRY MODE: re-login failed accounts from local store ────
+    if args.retry:
+        import failed_store
+        count = failed_store.count_sync()
+        logger.info("  Mode:       retry (%d failed accounts in store)", count)
+        logger.info("  Parallel:   %s", "⚡ YES" if settings.parallel else "🛡️ NO (sequential)")
+        logger.info("  Concurrency: %d", concurrent)
+        logger.info("")
+        await retry(providers if args.providers else None, concurrent, headless, proxy_url)
+        return
 
     # ── CONSUME MODE: no accounts file needed ────────────────────
     if args.consume:
@@ -638,11 +767,22 @@ Modes:
     python ryasai_auth.py --consume
     → Pull queued accounts from server, login here, push tokens back
 
+  RETRY:
+    python ryasai_auth.py --retry
+    → Re-login previously failed accounts from local store
+
+  CLEAR FAILED:
+    python ryasai_auth.py --retry-clear
+    → Clear the local failed accounts store
+
 Examples:
   python ryasai_auth.py accounts.txt
   python ryasai_auth.py accounts.txt --store
   python ryasai_auth.py --consume
   python ryasai_auth.py --consume --concurrency 5
+  python ryasai_auth.py --retry
+  python ryasai_auth.py --retry --providers kiro
+  python ryasai_auth.py --retry-clear
   python ryasai_auth.py accounts.txt --providers kiro,wavespeed
   python ryasai_auth.py accounts.txt --headed
   python ryasai_auth.py --consume --proxy socks5://user:pass@host:port
@@ -671,6 +811,16 @@ Accounts file format (one per line):
         "--consume",
         action="store_true",
         help="Pull queued accounts from server, login here, push results back",
+    )
+    mode.add_argument(
+        "--retry",
+        action="store_true",
+        help="Retry previously failed accounts from local store (~/.ryasai-auth/failed_accounts.json)",
+    )
+    mode.add_argument(
+        "--retry-clear",
+        action="store_true",
+        help="Clear the local failed accounts store and exit",
     )
 
     parser.add_argument("--providers", type=str, help="Comma-separated providers (default: from .env)")
