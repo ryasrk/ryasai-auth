@@ -118,8 +118,45 @@ python -m playwright install firefox && ok "Playwright Firefox installed" || {
     warn "Playwright Firefox install failed (Camoufox should still work)"
 }
 
-# ── Step 5: Environment Config ───────────────────────────────────
-step "5/5 — Environment Config"
+# ── Step 5: Go Rod Binary (stealth browser) ─────────────────────
+step "5/6 — Go Rod Binary"
+
+if ! command -v go &>/dev/null; then
+    info "Go not found — installing Go 1.22..."
+    GO_TAR="go1.22.5.linux-amd64.tar.gz"
+    curl -sL "https://go.dev/dl/$GO_TAR" -o "/tmp/$GO_TAR"
+    sudo rm -rf /usr/local/go
+    sudo tar -C /usr/local -xzf "/tmp/$GO_TAR"
+    rm -f "/tmp/$GO_TAR"
+    export PATH="/usr/local/go/bin:$PATH"
+    # Persist for future shells
+    if ! grep -q '/usr/local/go/bin' "$HOME/.profile" 2>/dev/null; then
+        echo 'export PATH="/usr/local/go/bin:$PATH"' >> "$HOME/.profile"
+    fi
+    ok "Installed: $(go version)"
+fi
+
+GO_VER=$(go version | grep -oP '\d+\.\d+')
+GO_MAJOR=$(echo "$GO_VER" | cut -d. -f1)
+GO_MINOR=$(echo "$GO_VER" | cut -d. -f2)
+if [[ "$GO_MAJOR" -ge 1 && "$GO_MINOR" -ge 22 ]]; then
+    ok "Go: $(go version)"
+else
+    err "Go 1.22+ required. Found: go$GO_VER"
+    err "Remove old Go and re-run setup, or install manually: https://go.dev/dl/"
+    exit 1
+fi
+
+info "Building rod-login binary..."
+mkdir -p "$SCRIPT_DIR/bin"
+cd "$SCRIPT_DIR/rod"
+go mod tidy
+go build -o "$SCRIPT_DIR/bin/rod-login" .
+cd "$SCRIPT_DIR"
+ok "Built: bin/rod-login"
+
+# ── Step 6: Environment Config ───────────────────────────────────
+step "6/6 — Environment Config"
 
 if [[ ! -f "$SCRIPT_DIR/.env" ]]; then
     cp "$SCRIPT_DIR/.env.example" "$SCRIPT_DIR/.env"

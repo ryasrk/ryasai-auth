@@ -16,3 +16,6 @@ pydantic-settings>=2.0.0,<3.0.0
 
 # Rich CLI output
 rich>=13.0.0
+
+# System monitoring (adaptive throttle)
+psutil>=5.9.0

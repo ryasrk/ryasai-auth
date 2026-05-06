@@ -36,8 +36,14 @@ import argparse
 import asyncio
 import logging
 import os
-import resource
 import signal
+
+try:
+    import resource
+    HAS_RESOURCE = True
+except ImportError:
+    resource = None  # type: ignore[assignment]
+    HAS_RESOURCE = False
 import sys
 import time
 from datetime import datetime, timezone
@@ -48,12 +54,13 @@ from config import get_settings
 settings = get_settings()
 
 # ── Bump file descriptor limit (browsers need many fds) ──────────
-try:
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    if soft < 65536:
-        resource.setrlimit(resource.RLIMIT_NOFILE, (min(65536, hard), hard))
-except (ValueError, OSError):
-    pass
+if HAS_RESOURCE:
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft < 65536:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (min(65536, hard), hard))
+    except (ValueError, OSError):
+        pass
 
 # ── Logging ──────────────────────────────────────────────────────
 logging.basicConfig(
@@ -204,6 +211,7 @@ async def consume(
     concurrent: int,
     headless: str,
     proxy_url: str,
+    browser_backend: str = "camoufox",
     poll_interval: int = 10,
 ):
     """Pull queued accounts from server, login locally, push results back.
@@ -308,6 +316,7 @@ async def consume(
                 result = await run_login(
                     email, password, provider,
                     headless=headless, proxy_url=proxy_url,
+                    browser_backend=browser_backend,
                 )
 
                 if result["status"] == "success":
@@ -385,6 +394,7 @@ async def local_login(
     concurrent: int,
     headless: str,
     proxy_url: str,
+    browser_backend: str = "camoufox",
 ):
     """Run browser login locally and push results to the server.
 
@@ -466,6 +476,7 @@ async def local_login(
             result = await run_login(
                 email, password, prov,
                 headless=headless, proxy_url=proxy_url,
+                browser_backend=browser_backend,
             )
 
             async with lock:
@@ -500,13 +511,53 @@ async def local_login(
 
     # ── PARALLEL MODE: run N accounts concurrently ───────────────
     if parallel:
-        semaphore = asyncio.Semaphore(concurrent)
+        from throttle import AdaptiveThrottle, ThrottleConfig, recommend_concurrency, set_process_priority
+
+        # Auto-detect safe concurrency if not explicitly set
+        effective_concurrent = min(concurrent, recommend_concurrency())
+        if effective_concurrent < concurrent:
+            logger.info(
+                "  ⚠️  Auto-reduced concurrency %d → %d (resource limit)",
+                concurrent, effective_concurrent,
+            )
+
+        # Lower process priority to avoid starving system
+        set_process_priority(nice_value=5)
+
+        # Setup adaptive throttle
+        if settings.adaptive_throttle:
+            throttle_cfg = ThrottleConfig(
+                max_concurrent=effective_concurrent,
+                min_concurrent=1,
+                cpu_high_watermark=settings.cpu_high_watermark,
+                cpu_low_watermark=settings.cpu_low_watermark,
+                mem_high_watermark=settings.mem_high_watermark,
+                stagger_delay=settings.stagger_delay,
+            )
+            throttle = AdaptiveThrottle(throttle_cfg)
+            throttle.start_monitor()
+            logger.info(
+                "  🎛️  Adaptive throttle: ON (cpu=%d%%↑/%d%%↓, mem=%d%%↑)",
+                int(settings.cpu_high_watermark),
+                int(settings.cpu_low_watermark),
+                int(settings.mem_high_watermark),
+            )
+        else:
+            throttle = None
+
+        semaphore = asyncio.Semaphore(effective_concurrent)
 
         async def _throttled_login(idx: int, acc: dict):
-            async with semaphore:
-                if not _running:
-                    return
-                await _login_account(idx, acc)
+            if throttle:
+                async with throttle.acquire():
+                    if not _running:
+                        return
+                    await _login_account(idx, acc)
+            else:
+                async with semaphore:
+                    if not _running:
+                        return
+                    await _login_account(idx, acc)
 
         tasks = [
             asyncio.create_task(_throttled_login(i + 1, acc))
@@ -575,6 +626,10 @@ async def local_login(
         logger.info("  ⏭️  Skipped:  %d (shutdown)", skipped)
     logger.info("  📊 Total:    %d/%d", success + failed, total)
     logger.info("  ⚡ Mode:     %s (concurrency=%d)", "PARALLEL" if parallel else "SEQUENTIAL", concurrent)
+    if parallel and settings.adaptive_throttle and throttle:
+        ts = throttle.stats
+        logger.info("  🎛️  Throttle: peak=%d, throttled=%d times", ts["peak_active"], ts["total_throttled"])
+        throttle.stop()
     if not _running:
         logger.info("  ⚠️  Stopped early due to shutdown signal")
     logger.info("")
@@ -661,7 +716,7 @@ async def retry(
 
     # Use local_login with the collected providers
     # local_login already hooks into failed_store (save on fail, remove on success)
-    await local_login(accounts, all_providers, concurrent, headless, proxy_url)
+    await local_login(accounts, all_providers, concurrent, headless, proxy_url, browser_backend)
 
     # Report remaining failures
     remaining = await failed_store.load_failed()
@@ -686,6 +741,7 @@ async def main(args):
     )
     concurrent = args.concurrency or settings.concurrency
     headless = "false" if args.headed else settings.camoufox_headless
+    browser_backend = args.browser or settings.browser_backend
     proxy_url = args.proxy or settings.proxy_url
 
     logger.info("╔══════════════════════════════════════════════════╗")
@@ -720,7 +776,7 @@ async def main(args):
         logger.info("  Concurrency: %d", concurrent)
         logger.info("  Poll:       %ds", args.poll_interval)
         logger.info("")
-        await consume(providers, concurrent, headless, proxy_url, args.poll_interval)
+        await consume(providers, concurrent, headless, proxy_url, browser_backend, args.poll_interval)
         return
 
     # ── STORE / LOCAL LOGIN: accounts file required ──────────────
@@ -746,7 +802,7 @@ async def main(args):
         if not settings.parallel:
             logger.info("  Delay:      %.1fs + jitter %.1fs", settings.account_delay, settings.account_delay_jitter)
         logger.info("")
-        await local_login(accounts, providers, concurrent, headless, proxy_url)
+        await local_login(accounts, providers, concurrent, headless, proxy_url, browser_backend)
 
 
 if __name__ == "__main__":
@@ -826,6 +882,8 @@ Accounts file format (one per line):
     parser.add_argument("--providers", type=str, help="Comma-separated providers (default: from .env)")
     parser.add_argument("--concurrency", type=int, help="Max concurrent logins (default: from .env)")
     parser.add_argument("--headed", action="store_true", help="Show browser window (for debugging)")
+    parser.add_argument("--browser", choices=["camoufox", "rod"], default=None,
+                        help="Browser backend: camoufox (default) or rod (go-rod subprocess)")
     parser.add_argument("--proxy", type=str, help="Proxy URL for browser sessions")
     parser.add_argument(
         "--poll-interval", type=int, default=10,

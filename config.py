@@ -44,9 +44,24 @@ class AuthSettings(BaseSettings):
     # Random jitter added to delay (0 to this value)
     account_delay_jitter: float = Field(default=3.0, alias="ACCOUNT_DELAY_JITTER")
 
+    # ── Adaptive Throttle ────────────────────────────────────────
+    # Enable adaptive CPU/memory-based throttling
+    adaptive_throttle: bool = Field(default=True, alias="ADAPTIVE_THROTTLE")
+    # CPU % above which concurrency is reduced
+    cpu_high_watermark: float = Field(default=80.0, alias="CPU_HIGH_WATERMARK")
+    # CPU % below which concurrency can increase
+    cpu_low_watermark: float = Field(default=50.0, alias="CPU_LOW_WATERMARK")
+    # Memory % above which concurrency is hard-throttled
+    mem_high_watermark: float = Field(default=85.0, alias="MEM_HIGH_WATERMARK")
+    # Stagger delay (seconds) between launching browsers
+    stagger_delay: float = Field(default=1.5, alias="STAGGER_DELAY")
+
     # ── Browser ──────────────────────────────────────────────────
     camoufox_headless: str = Field(default="true", alias="CAMOUFOX_HEADLESS")
+    browser_backend: str = Field(default="camoufox", alias="BROWSER_BACKEND")
     proxy_url: str = Field(default="", alias="PROXY_URL")
+    # GPU offload: "auto" (detect), "hardware" (ANGLE/GL), "vulkan", "off" (software)
+    gpu_mode: str = Field(default="auto", alias="GPU_MODE")
 
     # ── Logging ──────────────────────────────────────────────────
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")

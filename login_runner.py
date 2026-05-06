@@ -7,9 +7,12 @@ Returns a result dict ready to be pushed to the server.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import subprocess
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from providers.base import NormalizedAccount, ProviderResult
@@ -20,6 +23,15 @@ logger = logging.getLogger("ryasai-auth.login")
 MAX_RETRIES = 3
 BASE_DELAY = 2.0
 MAX_DELAY = 15.0
+
+ROD_BINARY = Path(__file__).parent / "bin" / "rod-login"
+
+# Provider → target URL that triggers Google OAuth
+ROD_TARGET_URLS = {
+    "wavespeed": "https://wavespeed.ai/center/default/google/login?redirect=https://wavespeed.ai/",
+    "kiro": "https://kiro.dev/login",
+    "canva": "https://www.canva.com/login",
+}
 
 
 def _get_adapter(provider: str):
@@ -51,6 +63,7 @@ async def run_login(
     *,
     headless: str = "true",
     proxy_url: str = "",
+    browser_backend: str = "camoufox",
 ) -> dict[str, Any]:
     """Run browser login for a single email/provider combo.
 
@@ -66,6 +79,9 @@ async def run_login(
             "timestamp": "...",
         }
     """
+    if browser_backend == "rod":
+        return await _run_rod_login(email, password, provider, headless=headless, proxy_url=proxy_url)
+
     from config import get_settings
     settings = get_settings()
 
@@ -154,6 +170,138 @@ async def run_login(
         "tokens": None,
         "quota": None,
         "error": last_error,
+        "worker_id": settings.worker_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+async def _run_rod_login(
+    email: str,
+    password: str,
+    provider: str,
+    *,
+    headless: str = "true",
+    proxy_url: str = "",
+) -> dict[str, Any]:
+    """Run login via go-rod subprocess."""
+    from config import get_settings
+    settings = get_settings()
+
+    if not ROD_BINARY.exists():
+        return {
+            "email": email,
+            "provider": provider,
+            "status": "failed",
+            "tokens": None,
+            "quota": None,
+            "error": f"rod binary not found at {ROD_BINARY}. Run: cd rod && bash build.sh",
+            "worker_id": settings.worker_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    target_url = ROD_TARGET_URLS.get(provider, "")
+    if not target_url:
+        return {
+            "email": email,
+            "provider": provider,
+            "status": "failed",
+            "tokens": None,
+            "quota": None,
+            "error": f"No rod target URL configured for provider: {provider}",
+            "worker_id": settings.worker_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    request_payload = json.dumps({
+        "email": email,
+        "password": password,
+        "provider": provider,
+        "target_url": target_url,
+        "headless": headless.lower() == "true",
+        "proxy": proxy_url,
+    })
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            str(ROD_BINARY),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input=request_payload.encode()),
+            timeout=120,
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        return {
+            "email": email,
+            "provider": provider,
+            "status": "failed",
+            "tokens": None,
+            "quota": None,
+            "error": "rod subprocess timed out (120s)",
+            "worker_id": settings.worker_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        return {
+            "email": email,
+            "provider": provider,
+            "status": "failed",
+            "tokens": None,
+            "quota": None,
+            "error": f"rod subprocess error: {e}",
+            "worker_id": settings.worker_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    if proc.returncode != 0:
+        err_msg = stderr.decode().strip() or f"rod exited with code {proc.returncode}"
+        return {
+            "email": email,
+            "provider": provider,
+            "status": "failed",
+            "tokens": None,
+            "quota": None,
+            "error": err_msg,
+            "worker_id": settings.worker_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    try:
+        rod_result = json.loads(stdout.decode().strip())
+    except json.JSONDecodeError as e:
+        return {
+            "email": email,
+            "provider": provider,
+            "status": "failed",
+            "tokens": None,
+            "quota": None,
+            "error": f"rod returned invalid JSON: {e}",
+            "worker_id": settings.worker_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    if rod_result.get("status") == "success":
+        return {
+            "email": email,
+            "provider": provider,
+            "status": "success",
+            "tokens": rod_result.get("cookies", {}),
+            "quota": None,
+            "error": None,
+            "worker_id": settings.worker_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    return {
+        "email": email,
+        "provider": provider,
+        "status": "failed",
+        "tokens": None,
+        "quota": None,
+        "error": rod_result.get("error", "unknown rod error"),
         "worker_id": settings.worker_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
