@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -273,86 +274,125 @@ func extractHost(rawURL string) string {
 }
 
 // handleCodebuddyLanding handles the CodeBuddy login page:
-// 1. Wait for page to load
-// 2. Click ToS checkbox (.checkmark)
-// 3. Click Google login button (#social-google or a[href*="/broker/google/login"])
+// The login form is inside an iframe (Keycloak). Strategy:
+//  1. Wait for iframe to load, extract its src URL
+//  2. Navigate the main page directly to the iframe URL (bypass iframe)
+//  3. Click "Log in" tab
+//  4. Click "Log in with Google" link
 func handleCodebuddyLanding(page *rod.Page) error {
-	// Wait for page to be ready
+	// Wait for iframe to appear
 	time.Sleep(2 * time.Second)
 
-	// Try to click the ToS checkbox
-	_, _ = page.Timeout(5*time.Second).Eval(`() => {
-		// Try iframe first
-		const iframes = document.querySelectorAll('iframe');
-		let target = document;
-		for (const iframe of iframes) {
-			try {
-				const doc = iframe.contentDocument || iframe.contentWindow.document;
-				if (doc && doc.querySelector('.checkmark')) {
-					target = doc;
-					break;
-				}
-			} catch(e) {}
+	// Step 1: Extract iframe src and navigate to it directly
+	// This avoids cross-frame issues — we make the iframe content the top-level page
+	iframeSrc := ""
+	for attempt := 0; attempt < 10; attempt++ {
+		result, err := page.Eval(`() => {
+			const iframe = document.querySelector('iframe');
+			if (iframe && iframe.src) return iframe.src;
+			return '';
+		}`)
+		if err == nil && result != nil {
+			iframeSrc = result.Value.Str()
 		}
-		const el = target.querySelector('div.checkmark, .checkmark, input[type="checkbox"]');
-		if (el && el.offsetParent !== null) {
-			el.click();
-			return true;
+		if iframeSrc != "" {
+			break
 		}
-		// Also try label with checkbox
-		const labels = target.querySelectorAll('label');
-		for (const l of labels) {
-			const cb = l.querySelector('input[type="checkbox"]');
-			if (cb && !cb.checked) {
-				cb.click();
-				return true;
-			}
-		}
-		return false;
-	}`)
+		time.Sleep(1 * time.Second)
+	}
 
-	randomDelay(500, 1000)
+	if iframeSrc != "" {
+		fmt.Fprintf(os.Stderr, "[codebuddy] navigating to iframe URL: %s\n", iframeSrc[:80])
+		err := page.Navigate(iframeSrc)
+		if err != nil {
+			return fmt.Errorf("failed to navigate to iframe URL: %w", err)
+		}
+		page.MustWaitLoad()
+		time.Sleep(2 * time.Second)
+	} else {
+		fmt.Fprintf(os.Stderr, "[codebuddy] no iframe found, trying on current page\n")
+	}
 
-	// Click Google login button
-	clicked := false
+	// Step 2: Click "Log in" tab (page defaults to "Sign up")
+	tabClicked := false
 	for attempt := 0; attempt < 5; attempt++ {
 		result, err := page.Eval(`() => {
-			// Try #social-google
-			const byId = document.querySelector('#social-google');
-			if (byId && byId.offsetParent !== null) {
-				byId.click();
-				return true;
-			}
-			// Try link with /broker/google/login
-			for (const a of document.querySelectorAll('a[href*="/broker/google/login"], a[href*="google"]')) {
-				if (a.offsetParent !== null) {
-					a.click();
-					return true;
-				}
-			}
-			// Try button with Google text
-			const phrases = ['sign in with google', 'login with google', 'continue with google', 'google'];
-			for (const btn of document.querySelectorAll('button, a, div[role="button"]')) {
-				if (btn.offsetParent === null) continue;
-				const txt = (btn.textContent || '').toLowerCase().trim();
-				if (phrases.some(p => txt.includes(p))) {
-					btn.click();
+			const els = document.querySelectorAll('div, span, button, a');
+			for (const el of els) {
+				const txt = (el.textContent || '').trim();
+				if (txt === 'Log in' && el.children.length === 0 && el.offsetParent !== null) {
+					el.click();
 					return true;
 				}
 			}
 			return false;
 		}`)
 		if err == nil && result != nil && result.Value.Bool() {
-			clicked = true
+			tabClicked = true
 			break
 		}
 		time.Sleep(1 * time.Second)
 	}
 
-	if !clicked {
+	if tabClicked {
+		fmt.Fprintf(os.Stderr, "[codebuddy] clicked Log in tab\n")
+	} else {
+		fmt.Fprintf(os.Stderr, "[codebuddy] could not click Log in tab, trying Google button directly\n")
+	}
+
+	randomDelay(800, 1500)
+
+	// Step 3: Get Google login link href and navigate to it directly
+	// (clicking <a> via JS doesn't always trigger navigation in headless)
+	googleURL := ""
+	for attempt := 0; attempt < 8; attempt++ {
+		result, err := page.Eval(`() => {
+			// Primary: link with href containing /broker/google/login
+			for (const a of document.querySelectorAll('a[href*="/broker/google/login"]')) {
+				if (a.offsetParent !== null) {
+					return a.href;
+				}
+			}
+			// Fallback: any link with "google" text
+			const phrases = ['log in with google', 'sign in with google', 'sign up with google', 'continue with google'];
+			for (const el of document.querySelectorAll('a')) {
+				if (el.offsetParent === null) continue;
+				const txt = (el.textContent || '').toLowerCase().trim();
+				if (phrases.some(p => txt.includes(p)) && el.href) {
+					return el.href;
+				}
+			}
+			return '';
+		}`)
+		if err == nil && result != nil {
+			googleURL = result.Value.Str()
+		}
+		if googleURL != "" {
+			break
+		}
+		time.Sleep(1 * time.Second)
+	}
+
+	if googleURL == "" {
+		// Debug: dump what links exist
+		links, _ := page.Eval(`() => {
+			const result = [];
+			document.querySelectorAll('a').forEach(a => {
+				result.push({href: a.href, text: (a.textContent||'').trim().substring(0,50)});
+			});
+			return JSON.stringify(result.slice(0, 10));
+		}`)
+		if links != nil {
+			fmt.Fprintf(os.Stderr, "[codebuddy] available links: %s\n", links.Value.Str())
+		}
 		return fmt.Errorf("could not find Google login button on codebuddy page")
 	}
 
-	randomDelay(500, 1000)
+	fmt.Fprintf(os.Stderr, "[codebuddy] navigating to Google broker: %s\n", googleURL[:min(80, len(googleURL))])
+	if err := page.Navigate(googleURL); err != nil {
+		return fmt.Errorf("failed to navigate to Google broker URL: %w", err)
+	}
+	_ = page.Timeout(15 * time.Second).WaitLoad()
+
 	return nil
 }
