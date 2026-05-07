@@ -301,7 +301,12 @@ async def _run_rod_login(
                     "provider": provider,
                     "status": "success",
                     "tokens": {"api_key": api_key},
-                    "quota": None,
+                    "quota": {
+                        "credit_capacity_size": 250,
+                        "credit_capacity_used": 0,
+                        "credit_capacity_remain": 250,
+                        "credit_total_dosage": 250,
+                    },
                     "error": None,
                     "worker_id": settings.worker_id,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
