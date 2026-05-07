@@ -425,18 +425,10 @@ async def local_login(
         logger.error("❌ Server connection failed: %s", e)
         return
 
-    # Step 2: Push accounts to server (store only — no Redis queue)
-    # We process accounts locally, so don't queue them for remote consumers.
-    # This prevents double-processing if a --consume worker is also running.
-    logger.info("📤 Registering %d accounts on server (store_only=true)...", len(accounts))
-    for i in range(0, len(accounts), 50):
-        chunk = accounts[i:i + 50]
-        try:
-            await api_client.push_accounts(
-                chunk, providers=providers, store_only=True,
-            )
-        except Exception as e:
-            logger.warning("  Failed to register chunk: %s (continuing anyway)", e)
+    # Step 2: Skip pre-registration — only push accounts that succeed login.
+    # Previously we registered all accounts upfront (store_only=true), but this
+    # pollutes the server DB with accounts that never get a valid token.
+    # Now accounts are only created server-side when push_result is called on success.
 
     # Step 3: Run login
     total = len(accounts) * len(providers)
