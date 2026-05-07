@@ -33,6 +33,17 @@ func DefaultStealthConfig() StealthConfig {
 // ApplyFullStealthToPage applies all stealth layers to a page.
 // Call this after page creation but before navigation.
 func ApplyFullStealthToPage(browser *rod.Browser, page *rod.Page, cfg StealthConfig) error {
+	// 0. HARDENED LAYER (MUST BE FIRST) — patches detection mechanisms themselves
+	//    - Function.prototype.toString spoofing (makes all overrides look native)
+	//    - Proxy detection shield
+	//    - CDP timing side-channel normalization
+	//    - Chrome headless tells (chrome.app, csi, loadTimes, etc.)
+	//    - Native-level property descriptors
+	//    - Iframe isolation
+	if err := ApplyHardenedStealth(page); err != nil {
+		log.Printf("[stealth] hardened layer warning: %v", err)
+	}
+
 	// 1. go-rod/stealth integration (CDP leak patches)
 	page, err := ApplyRodStealth(page)
 	if err != nil {

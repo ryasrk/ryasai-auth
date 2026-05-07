@@ -30,6 +30,7 @@ ROD_BINARY = Path(__file__).parent / "bin" / "rod-login"
 ROD_TARGET_URLS = {
     "wavespeed": "https://wavespeed.ai/center/default/google/login?redirect=https://wavespeed.ai/",
     "kiro": "https://kiro.dev/login",
+    "codebuddy": "https://www.codebuddy.ai/login",
     "canva": "https://www.canva.com/login",
 }
 
@@ -79,7 +80,7 @@ async def run_login(
             "timestamp": "...",
         }
     """
-    if browser_backend == "rod":
+    if browser_backend == "rod" and provider in ROD_TARGET_URLS:
         return await _run_rod_login(email, password, provider, headless=headless, proxy_url=proxy_url)
 
     from config import get_settings

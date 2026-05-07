@@ -147,12 +147,22 @@ func applyStealthViaAddScript(page *rod.Page) error {
 
 // Layer 7
 const stealthWebdriver = `(() => {
-	Object.defineProperty(navigator, 'webdriver', {
-		get: () => undefined,
-		configurable: true
-	});
-	// Also delete from prototype
-	delete Object.getPrototypeOf(navigator).webdriver;
+	// Handled by stealth_hardened.go (hardenedPropertyDescriptors)
+	// which puts webdriver on Navigator.prototype with native-looking getter.
+	// This is a fallback in case hardened layer didn't run first.
+	if (typeof window.__nativeProperty === 'function') {
+		// Use hardened helper — produces native toString()
+		try { delete navigator.webdriver; } catch(e) {}
+		try { delete Navigator.prototype.webdriver; } catch(e) {}
+		window.__nativeProperty(Navigator.prototype, 'webdriver', () => false);
+	} else {
+		// Fallback (less stealthy)
+		Object.defineProperty(navigator, 'webdriver', {
+			get: () => false,
+			configurable: true
+		});
+		delete Object.getPrototypeOf(navigator).webdriver;
+	}
 })()`
 
 // Layer 8
@@ -221,28 +231,41 @@ const stealthChromeRuntime = `(() => {
 // Layer 11
 const stealthPermissions = `(() => {
 	const originalQuery = window.navigator.permissions.query.bind(window.navigator.permissions);
-	window.navigator.permissions.query = (parameters) => {
+	const patchedQuery = (parameters) => {
 		if (parameters.name === 'notifications') {
-			return Promise.resolve({ state: Notification.permission });
+			return Promise.resolve({ state: 'default' });
 		}
 		return originalQuery(parameters);
 	};
+	if (typeof window.__markNative === 'function') {
+		window.__markNative(patchedQuery, 'query');
+	}
+	window.navigator.permissions.query = patchedQuery;
 })()`
 
 // Layer 12
 const stealthWebGL = `(() => {
 	const getParameter = WebGLRenderingContext.prototype.getParameter;
-	WebGLRenderingContext.prototype.getParameter = function(parameter) {
+	const patchedGetParam = function(parameter) {
 		if (parameter === 37445) return 'Google Inc. (Intel)';
 		if (parameter === 37446) return 'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)';
 		return getParameter.call(this, parameter);
 	};
+	if (typeof window.__markNative === 'function') {
+		window.__markNative(patchedGetParam, 'getParameter');
+	}
+	WebGLRenderingContext.prototype.getParameter = patchedGetParam;
+
 	const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
-	WebGL2RenderingContext.prototype.getParameter = function(parameter) {
+	const patchedGetParam2 = function(parameter) {
 		if (parameter === 37445) return 'Google Inc. (Intel)';
 		if (parameter === 37446) return 'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)';
 		return getParameter2.call(this, parameter);
 	};
+	if (typeof window.__markNative === 'function') {
+		window.__markNative(patchedGetParam2, 'getParameter');
+	}
+	WebGL2RenderingContext.prototype.getParameter = patchedGetParam2;
 })()`
 
 // Layer 13

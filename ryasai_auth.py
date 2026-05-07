@@ -334,12 +334,13 @@ async def consume(
                         result.get("error", "unknown"),
                     )
 
-                # Push result immediately
-                try:
-                    await api_client.push_result(result)
-                except Exception as e:
-                    logger.warning("  Failed to push result: %s (buffering)", e)
-                    results_buffer.append(result)
+                # Push result to server (only success — failed stays local)
+                if result["status"] == "success":
+                    try:
+                        await api_client.push_result(result)
+                    except Exception as e:
+                        logger.warning("  Failed to push result: %s (buffering)", e)
+                        results_buffer.append(result)
 
             # Anti-ban delay between accounts
             if _running and job_idx < len(jobs) - 1:
@@ -501,13 +502,14 @@ async def local_login(
                         result.get("error", "unknown"),
                     )
 
-            # Push result to server immediately
-            try:
-                await api_client.push_result(result)
-            except Exception as e:
-                logger.warning("  Failed to push result: %s (buffering)", e)
-                async with lock:
-                    results_buffer.append(result)
+            # Push result to server (only success — failed stays local)
+            if result["status"] == "success":
+                try:
+                    await api_client.push_result(result)
+                except Exception as e:
+                    logger.warning("  Failed to push result: %s (buffering)", e)
+                    async with lock:
+                        results_buffer.append(result)
 
     # ── PARALLEL MODE: run N accounts concurrently ───────────────
     if parallel:

@@ -28,6 +28,13 @@ func googleOAuthLogin(browser *rod.Browser, req LoginRequest) LoginResult {
 		_ = err
 	}
 
+	// Provider-specific landing page handling (click Google login button etc.)
+	if req.Provider == "codebuddy" {
+		if err := handleCodebuddyLanding(page); err != nil {
+			return LoginResult{Status: "failed", Cookies: map[string]string{}, Error: "codebuddy landing: " + err.Error()}
+		}
+	}
+
 	// Wait for Google login page to load
 	if err := waitForGoogleLogin(page); err != nil {
 		return LoginResult{Status: "failed", Cookies: map[string]string{}, Error: err.Error()}
@@ -263,4 +270,89 @@ func extractHost(rawURL string) string {
 		return parts[len(parts)-2] + "." + parts[len(parts)-1]
 	}
 	return s
+}
+
+// handleCodebuddyLanding handles the CodeBuddy login page:
+// 1. Wait for page to load
+// 2. Click ToS checkbox (.checkmark)
+// 3. Click Google login button (#social-google or a[href*="/broker/google/login"])
+func handleCodebuddyLanding(page *rod.Page) error {
+	// Wait for page to be ready
+	time.Sleep(2 * time.Second)
+
+	// Try to click the ToS checkbox
+	_, _ = page.Timeout(5*time.Second).Eval(`() => {
+		// Try iframe first
+		const iframes = document.querySelectorAll('iframe');
+		let target = document;
+		for (const iframe of iframes) {
+			try {
+				const doc = iframe.contentDocument || iframe.contentWindow.document;
+				if (doc && doc.querySelector('.checkmark')) {
+					target = doc;
+					break;
+				}
+			} catch(e) {}
+		}
+		const el = target.querySelector('div.checkmark, .checkmark, input[type="checkbox"]');
+		if (el && el.offsetParent !== null) {
+			el.click();
+			return true;
+		}
+		// Also try label with checkbox
+		const labels = target.querySelectorAll('label');
+		for (const l of labels) {
+			const cb = l.querySelector('input[type="checkbox"]');
+			if (cb && !cb.checked) {
+				cb.click();
+				return true;
+			}
+		}
+		return false;
+	}`)
+
+	randomDelay(500, 1000)
+
+	// Click Google login button
+	clicked := false
+	for attempt := 0; attempt < 5; attempt++ {
+		result, err := page.Eval(`() => {
+			// Try #social-google
+			const byId = document.querySelector('#social-google');
+			if (byId && byId.offsetParent !== null) {
+				byId.click();
+				return true;
+			}
+			// Try link with /broker/google/login
+			for (const a of document.querySelectorAll('a[href*="/broker/google/login"], a[href*="google"]')) {
+				if (a.offsetParent !== null) {
+					a.click();
+					return true;
+				}
+			}
+			// Try button with Google text
+			const phrases = ['sign in with google', 'login with google', 'continue with google', 'google'];
+			for (const btn of document.querySelectorAll('button, a, div[role="button"]')) {
+				if (btn.offsetParent === null) continue;
+				const txt = (btn.textContent || '').toLowerCase().trim();
+				if (phrases.some(p => txt.includes(p))) {
+					btn.click();
+					return true;
+				}
+			}
+			return false;
+		}`)
+		if err == nil && result != nil && result.Value.Bool() {
+			clicked = true
+			break
+		}
+		time.Sleep(1 * time.Second)
+	}
+
+	if !clicked {
+		return fmt.Errorf("could not find Google login button on codebuddy page")
+	}
+
+	randomDelay(500, 1000)
+	return nil
 }
