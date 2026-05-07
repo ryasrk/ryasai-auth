@@ -290,11 +290,39 @@ async def _run_rod_login(
         }
 
     if rod_result.get("status") == "success":
+        cookies = rod_result.get("cookies", {})
+
+        # Provider-specific post-processing: exchange cookies for API key
+        if provider == "codebuddy" and cookies:
+            api_key = await _rod_codebuddy_get_api_key(cookies)
+            if api_key:
+                return {
+                    "email": email,
+                    "provider": provider,
+                    "status": "success",
+                    "tokens": {"api_key": api_key},
+                    "quota": None,
+                    "error": None,
+                    "worker_id": settings.worker_id,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+            else:
+                return {
+                    "email": email,
+                    "provider": provider,
+                    "status": "failed",
+                    "tokens": None,
+                    "quota": None,
+                    "error": "rod login succeeded but failed to create API key from cookies",
+                    "worker_id": settings.worker_id,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+
         return {
             "email": email,
             "provider": provider,
             "status": "success",
-            "tokens": rod_result.get("cookies", {}),
+            "tokens": cookies,
             "quota": None,
             "error": None,
             "worker_id": settings.worker_id,
@@ -311,3 +339,94 @@ async def _run_rod_login(
         "worker_id": settings.worker_id,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+
+
+async def _rod_codebuddy_get_api_key(cookies: dict[str, str]) -> str | None:
+    """After rod login succeeds, use cookies to create a CodeBuddy API key.
+
+    Steps:
+      1. Set region (Singapore) via /console/login/account
+      2. Get userEnterpriseId via /console/accounts
+      3. Create API key via /console/api/client/v1/api-keys
+    """
+    import time
+    import aiohttp
+
+    base_url = os.environ.get("BATCHER_CODEBUDDY_BASE_URL", "https://www.codebuddy.ai")
+    cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+
+    headers = {
+        "Cookie": cookie_header,
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
+        "X-Requested-With": "XMLHttpRequest",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Origin": base_url,
+        "Referer": f"{base_url}/",
+    }
+
+    timeout = aiohttp.ClientTimeout(total=20)
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as client:
+            # Step 1: Set region (Singapore)
+            region_payload = {
+                "attributes": {
+                    "countryCode": ["65"],
+                    "countryFullName": ["Singapore"],
+                    "countryName": ["SG"],
+                }
+            }
+            try:
+                async with client.post(
+                    f"{base_url}/console/login/account", json=region_payload
+                ) as resp:
+                    logger.debug("  [rod/codebuddy] set region status=%d", resp.status)
+            except Exception as e:
+                logger.debug("  [rod/codebuddy] set region failed: %s", e)
+
+            # Step 2: Get userEnterpriseId
+            user_enterprise_id = "personal-edition-user-id"
+            try:
+                async with client.get(f"{base_url}/console/accounts") as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        accounts = (data.get("data") or {}).get("accounts") or []
+                        if accounts:
+                            user_enterprise_id = str(
+                                accounts[0].get("userEnterpriseId") or user_enterprise_id
+                            )
+                        logger.debug("  [rod/codebuddy] enterprise_id=%s", user_enterprise_id)
+            except Exception as e:
+                logger.debug("  [rod/codebuddy] get accounts failed: %s", e)
+
+            # Step 3: Create API key
+            timestamp = int(time.time())
+            key_payload = {
+                "name": f"rod-{timestamp}",
+                "expire_in_days": -1,
+                "user_enterprise_id": user_enterprise_id,
+            }
+            async with client.post(
+                f"{base_url}/console/api/client/v1/api-keys", json=key_payload
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning("  [rod/codebuddy] create API key failed: status=%d body=%s", resp.status, body[:150])
+                    return None
+
+                payload = await resp.json()
+                if payload.get("code") != 0:
+                    logger.warning("  [rod/codebuddy] create API key error code=%s", payload.get("code"))
+                    return None
+
+                api_key = str((payload.get("data") or {}).get("key") or "").strip()
+                if api_key:
+                    logger.info("  [rod/codebuddy] API key created: %s...", api_key[:20])
+                    return api_key
+
+                return None
+
+    except Exception as e:
+        logger.warning("  [rod/codebuddy] API key creation error: %s", e)
+        return None

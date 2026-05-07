@@ -68,8 +68,11 @@ func googleOAuthLogin(browser *rod.Browser, req LoginRequest) LoginResult {
 func waitForGoogleLogin(page *rod.Page) error {
 	for i := 0; i < 30; i++ {
 		time.Sleep(500 * time.Millisecond)
-		url := page.MustInfo().URL
-		if strings.Contains(url, "accounts.google.com") {
+		info, err := page.Info()
+		if err != nil {
+			continue
+		}
+		if strings.Contains(info.URL, "accounts.google.com") {
 			return nil
 		}
 	}
@@ -94,7 +97,7 @@ func fillEmail(page *rod.Page, email string) error {
 	// Click Next
 	if err := clickNextButton(page); err != nil {
 		// Try pressing Enter as fallback
-		page.Keyboard.MustType(input.Enter)
+		_ = page.Keyboard.Type(input.Enter)
 	}
 
 	return nil
@@ -105,14 +108,33 @@ func waitForPasswordStep(page *rod.Page) error {
 		time.Sleep(500 * time.Millisecond)
 
 		// Check for challenge/error pages
-		url := page.MustInfo().URL
+		info, infoErr := page.Info()
+		if infoErr != nil {
+			continue
+		}
+		url := info.URL
 		if strings.Contains(url, "/challenge/") && !strings.Contains(url, "/challenge/pwd") {
 			return fmt.Errorf("google challenge detected (captcha/2fa): %s", url)
 		}
 
-		// Check if password input is visible
-		has, _, _ := page.Has(`input[type="password"], input[name="Passwd"]`)
-		if has {
+		// Check for Google error messages (e.g. "Couldn't find your Google Account")
+		if res, err := page.Eval(`() => {
+			const errs = document.querySelectorAll('[class*="error"], [class*="Error"], [role="alert"], .o6cuMc, .dEOOab');
+			for (const el of errs) {
+				if (el.offsetParent !== null && el.textContent.trim().length > 5) {
+					return el.textContent.trim().substring(0, 150);
+				}
+			}
+			return '';
+		}`); err == nil && res != nil && res.Value.Str() != "" {
+			return fmt.Errorf("google error after email: %s", res.Value.Str())
+		}
+
+		// Check if password input is visible (not just in DOM)
+		if res, err := page.Eval(`() => {
+			const el = document.querySelector('input[type="password"], input[name="Passwd"]');
+			return el && el.offsetParent !== null;
+		}`); err == nil && res != nil && res.Value.Bool() {
 			return nil
 		}
 	}
@@ -120,9 +142,38 @@ func waitForPasswordStep(page *rod.Page) error {
 }
 
 func fillPassword(page *rod.Page, password string) error {
-	el, err := page.Timeout(10 * time.Second).Element(`input[type="password"], input[name="Passwd"]`)
+	// Wait for password input to appear and be visible
+	el, err := page.Timeout(15 * time.Second).Element(`input[type="password"], input[name="Passwd"]`)
 	if err != nil {
 		return fmt.Errorf("password input not found: %w", err)
+	}
+
+	// Wait for element to be interactable (Google has transition animations)
+	_, err = el.WaitInteractable()
+	if err != nil {
+		// Retry after a short wait
+		time.Sleep(3 * time.Second)
+		_, err = el.WaitInteractable()
+		if err != nil {
+			// Debug: check what's on the page
+			pageURL := ""
+			if info, e := page.Info(); e == nil {
+				pageURL = info.URL
+			}
+			errText := ""
+			if res, e := page.Eval(`() => {
+				const errs = document.querySelectorAll('[class*="error"], [class*="Error"], [role="alert"], .o6cuMc');
+				const texts = [];
+				errs.forEach(el => { if (el.offsetParent !== null) texts.push(el.textContent.trim()); });
+				return texts.join(' | ').substring(0, 200);
+			}`); e == nil && res != nil {
+				errText = res.Value.Str()
+			}
+			if errText != "" {
+				return fmt.Errorf("password input not interactable (page error: %s) url: %s", errText, pageURL)
+			}
+			return fmt.Errorf("password input not interactable: %w (url: %s)", err, pageURL)
+		}
 	}
 
 	// Layer 22: scroll noise
@@ -135,7 +186,7 @@ func fillPassword(page *rod.Page, password string) error {
 
 	// Layer 20: human-like click on Next
 	if err := clickNextButton(page); err != nil {
-		page.Keyboard.MustType(input.Enter)
+		_ = page.Keyboard.Type(input.Enter)
 	}
 
 	return nil
@@ -169,7 +220,11 @@ func waitForProviderRedirect(page *rod.Page, req LoginRequest) (map[string]strin
 	for i := 0; i < 60; i++ {
 		time.Sleep(1 * time.Second)
 
-		url := page.MustInfo().URL
+		info, infoErr := page.Info()
+		if infoErr != nil {
+			continue
+		}
+		url := info.URL
 
 		// Handle consent screens
 		if strings.Contains(url, "/oauthchooseaccount") ||
@@ -179,8 +234,31 @@ func waitForProviderRedirect(page *rod.Page, req LoginRequest) (map[string]strin
 			continue
 		}
 
+		// Debug: log URL periodically
+		if i%10 == 0 {
+			fmt.Fprintf(os.Stderr, "[redirect] t=%ds url=%s\n", i, url[:min(80, len(url))])
+		}
+
+		// Handle Google interstitial pages (TOS, speedbump, consent, oauth)
+		if strings.Contains(url, "accounts.google.com") {
+			if strings.Contains(url, "/speedbump/") ||
+				strings.Contains(url, "/termsofservice") ||
+				strings.Contains(url, "/consent") ||
+				strings.Contains(url, "/oauthchooseaccount") ||
+				strings.Contains(url, "/signin/oauth") ||
+				strings.Contains(url, "/gaplustos") {
+				handleConsentScreen(page)
+			}
+			continue
+		}
+
 		// Check if we're back on provider
 		if providerHost != "" && strings.Contains(url, providerHost) {
+			// For codebuddy: skip Keycloak broker/endpoint callbacks — wait for app page
+			if req.Provider == "codebuddy" && strings.Contains(url, "/auth/realms/copilot/broker/") {
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "[redirect] landed on: %s\n", url[:min(100, len(url))])
 			return extractCookies(page, providerHost)
 		}
 	}
@@ -197,6 +275,8 @@ func handleConsentScreen(page *rod.Page) {
 		`button[id="submit_approve_access"]`,
 		`input[type="submit"]`,
 		`#confirm`,
+		`button[type="submit"]`,
+		`[data-idom-class*="submit"]`,
 	}
 
 	for _, sel := range selectors {
@@ -208,38 +288,93 @@ func handleConsentScreen(page *rod.Page) {
 		}
 	}
 
-	// Fallback: try any button with allow/continue text
-	buttons, _ := page.Elements(`button, input[type="submit"], div[role="button"]`)
+	// Fallback: try any button/link with consent-related text
+	buttons, _ := page.Elements(`button, input[type="submit"], div[role="button"], a[role="button"], span[role="button"]`)
 	for _, btn := range buttons {
 		text, _ := btn.Text()
 		lower := strings.ToLower(text)
 		if strings.Contains(lower, "allow") ||
 			strings.Contains(lower, "continue") ||
 			strings.Contains(lower, "accept") ||
-			strings.Contains(lower, "agree") {
+			strings.Contains(lower, "agree") ||
+			strings.Contains(lower, "i agree") ||
+			strings.Contains(lower, "next") ||
+			strings.Contains(lower, "confirm") ||
+			strings.Contains(lower, "proceed") {
 			humanClick(page, btn)
+			fmt.Fprintf(os.Stderr, "[consent] clicked: %s\n", lower[:min(40, len(lower))])
 			randomDelay(800, 1500)
 			return
 		}
 	}
+
+	// Last resort: try clicking any visible button on the page
+	allBtns, _ := page.Elements(`button`)
+	for _, btn := range allBtns {
+		visible, _ := btn.Visible()
+		if visible {
+			humanClick(page, btn)
+			fmt.Fprintf(os.Stderr, "[consent] clicked first visible button\n")
+			randomDelay(800, 1500)
+			return
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "[consent] no clickable button found\n")
 }
 
 func extractCookies(page *rod.Page, host string) (map[string]string, error) {
-	cookies, err := page.Cookies(nil)
+	// Wait for page to fully load and set cookies after redirect chain
+	_ = page.Timeout(15 * time.Second).WaitLoad()
+	time.Sleep(3 * time.Second)
+
+	// Use CDP to get ALL cookies from the browser (all domains)
+	cookies, err := proto.StorageGetCookies{
+		BrowserContextID: "",
+	}.Call(page)
+
 	if err != nil {
-		return nil, fmt.Errorf("failed to get cookies: %w", err)
+		// Fallback to page.Cookies
+		pageCookies, err2 := page.Cookies(nil)
+		if err2 != nil {
+			return nil, fmt.Errorf("failed to get cookies: %w (cdp: %w)", err2, err)
+		}
+		result := make(map[string]string)
+		for _, c := range pageCookies {
+			result[c.Name] = c.Value
+		}
+		return result, nil
 	}
 
+	// Filter cookies for provider domain
 	result := make(map[string]string)
-	for _, c := range cookies {
+	for _, c := range cookies.Cookies {
 		if strings.Contains(c.Domain, host) || isTokenCookie(c.Name) {
 			result[c.Name] = c.Value
 		}
 	}
 
+	// If no provider cookies, get all
 	if len(result) == 0 {
-		return result, fmt.Errorf("no provider cookies found after redirect")
+		for _, c := range cookies.Cookies {
+			result[c.Name] = c.Value
+		}
 	}
+
+	if len(result) == 0 {
+		return result, fmt.Errorf("no cookies found after redirect to %s", host)
+	}
+
+	// Debug: show domains
+	domains := make(map[string]int)
+	for _, c := range cookies.Cookies {
+		domains[c.Domain]++
+	}
+	fmt.Fprintf(os.Stderr, "[cookies] total=%d, provider=%d (host=%s), domains: ", len(cookies.Cookies), len(result), host)
+	for d, n := range domains {
+		fmt.Fprintf(os.Stderr, "%s(%d) ", d, n)
+	}
+	fmt.Fprintf(os.Stderr, "\n")
 
 	return result, nil
 }
@@ -307,7 +442,7 @@ func handleCodebuddyLanding(page *rod.Page) error {
 		if err != nil {
 			return fmt.Errorf("failed to navigate to iframe URL: %w", err)
 		}
-		page.MustWaitLoad()
+		_ = page.Timeout(10 * time.Second).WaitLoad()
 		time.Sleep(2 * time.Second)
 	} else {
 		fmt.Fprintf(os.Stderr, "[codebuddy] no iframe found, trying on current page\n")

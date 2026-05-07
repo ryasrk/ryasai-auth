@@ -367,9 +367,11 @@ const stealthHairline = `(() => {
 
 // Layer 19: Human-like typing with random inter-key delays
 func humanType(page *rod.Page, el *rod.Element, text string) {
-	el.MustSelectAllText()
+	// Clear existing text (non-panic version)
+	_ = el.SelectAllText()
+	time.Sleep(100 * time.Millisecond)
 	for _, ch := range text {
-		el.MustInput(string(ch))
+		_ = el.Input(string(ch))
 		delay := 50 + rand.Intn(100) // 50-150ms per keystroke
 		time.Sleep(time.Duration(delay) * time.Millisecond)
 	}
