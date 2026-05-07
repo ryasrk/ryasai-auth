@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -18,45 +19,36 @@ func googleOAuthLogin(browser *rod.Browser, req LoginRequest) LoginResult {
 	}
 	defer page.Close()
 
-	// Apply stealth JS injections (layers 7-18)
 	applyStealthViaAddScript(page)
 	applyStealth(page)
 
-	// Apply enhanced stealth (CDP cloaking, timezone, fonts, connection, WS timing)
 	cfg := DefaultStealthConfig()
 	if err := ApplyFullStealthToPage(browser, page, cfg); err != nil {
-		// Non-fatal: log and continue
 		_ = err
 	}
 
-	// Provider-specific landing page handling (click Google login button etc.)
 	if req.Provider == "codebuddy" {
 		if err := handleCodebuddyLanding(page); err != nil {
 			return LoginResult{Status: "failed", Cookies: map[string]string{}, Error: "codebuddy landing: " + err.Error()}
 		}
 	}
 
-	// Wait for Google login page to load
 	if err := waitForGoogleLogin(page); err != nil {
 		return LoginResult{Status: "failed", Cookies: map[string]string{}, Error: err.Error()}
 	}
 
-	// Fill email
 	if err := fillEmail(page, req.Email); err != nil {
 		return LoginResult{Status: "failed", Cookies: map[string]string{}, Error: "email step: " + err.Error()}
 	}
 
-	// Wait for password step
 	if err := waitForPasswordStep(page); err != nil {
 		return LoginResult{Status: "failed", Cookies: map[string]string{}, Error: err.Error()}
 	}
 
-	// Fill password
 	if err := fillPassword(page, req.Password); err != nil {
 		return LoginResult{Status: "failed", Cookies: map[string]string{}, Error: "password step: " + err.Error()}
 	}
 
-	// Wait for redirect back to provider
 	cookies, err := waitForProviderRedirect(page, req)
 	if err != nil {
 		return LoginResult{Status: "failed", Cookies: map[string]string{}, Error: err.Error()}
@@ -80,23 +72,17 @@ func waitForGoogleLogin(page *rod.Page) error {
 }
 
 func fillEmail(page *rod.Page, email string) error {
-	// Wait for email input
 	el, err := page.Timeout(15 * time.Second).Element(`input[type="email"], input[name="identifier"], #identifierId`)
 	if err != nil {
 		return fmt.Errorf("email input not found: %w", err)
 	}
 
-	// Layer 22: scroll noise before interaction
 	scrollNoise(page)
 	randomDelay(200, 600)
-
-	// Layer 19: human-like typing
 	humanType(page, el, email)
 	randomDelay(300, 800)
 
-	// Click Next
 	if err := clickNextButton(page); err != nil {
-		// Try pressing Enter as fallback
 		_ = page.Keyboard.Type(input.Enter)
 	}
 
@@ -107,7 +93,6 @@ func waitForPasswordStep(page *rod.Page) error {
 	for i := 0; i < 30; i++ {
 		time.Sleep(500 * time.Millisecond)
 
-		// Check for challenge/error pages
 		info, infoErr := page.Info()
 		if infoErr != nil {
 			continue
@@ -117,7 +102,6 @@ func waitForPasswordStep(page *rod.Page) error {
 			return fmt.Errorf("google challenge detected (captcha/2fa): %s", url)
 		}
 
-		// Check for Google error messages (e.g. "Couldn't find your Google Account")
 		if res, err := page.Eval(`() => {
 			const errs = document.querySelectorAll('[class*="error"], [class*="Error"], [role="alert"], .o6cuMc, .dEOOab');
 			for (const el of errs) {
@@ -130,7 +114,6 @@ func waitForPasswordStep(page *rod.Page) error {
 			return fmt.Errorf("google error after email: %s", res.Value.Str())
 		}
 
-		// Check if password input is visible (not just in DOM)
 		if res, err := page.Eval(`() => {
 			const el = document.querySelector('input[type="password"], input[name="Passwd"]');
 			return el && el.offsetParent !== null;
@@ -142,20 +125,16 @@ func waitForPasswordStep(page *rod.Page) error {
 }
 
 func fillPassword(page *rod.Page, password string) error {
-	// Wait for password input to appear and be visible
 	el, err := page.Timeout(15 * time.Second).Element(`input[type="password"], input[name="Passwd"]`)
 	if err != nil {
 		return fmt.Errorf("password input not found: %w", err)
 	}
 
-	// Wait for element to be interactable (Google has transition animations)
 	_, err = el.WaitInteractable()
 	if err != nil {
-		// Retry after a short wait
 		time.Sleep(3 * time.Second)
 		_, err = el.WaitInteractable()
 		if err != nil {
-			// Debug: check what's on the page
 			pageURL := ""
 			if info, e := page.Info(); e == nil {
 				pageURL = info.URL
@@ -176,15 +155,11 @@ func fillPassword(page *rod.Page, password string) error {
 		}
 	}
 
-	// Layer 22: scroll noise
 	scrollNoise(page)
 	randomDelay(200, 500)
-
-	// Layer 19: human-like typing
 	humanType(page, el, password)
 	randomDelay(400, 900)
 
-	// Layer 20: human-like click on Next
 	if err := clickNextButton(page); err != nil {
 		_ = page.Keyboard.Type(input.Enter)
 	}
@@ -193,7 +168,6 @@ func fillPassword(page *rod.Page, password string) error {
 }
 
 func clickNextButton(page *rod.Page) error {
-	// Try standard Google Next buttons
 	selectors := []string{
 		"#identifierNext button",
 		"#passwordNext button",
@@ -205,7 +179,6 @@ func clickNextButton(page *rod.Page) error {
 	for _, sel := range selectors {
 		has, el, _ := page.Has(sel)
 		if has && el != nil {
-			// Layer 20: human-like mouse movement + click
 			randomDelay(100, 300)
 			return humanClick(page, el)
 		}
@@ -214,62 +187,9 @@ func clickNextButton(page *rod.Page) error {
 	return fmt.Errorf("no next button found")
 }
 
-func waitForProviderRedirect(page *rod.Page, req LoginRequest) (map[string]string, error) {
-	providerHost := extractHost(req.TargetURL)
-
-	for i := 0; i < 60; i++ {
-		time.Sleep(1 * time.Second)
-
-		info, infoErr := page.Info()
-		if infoErr != nil {
-			continue
-		}
-		url := info.URL
-
-		// Handle consent screens
-		if strings.Contains(url, "/oauthchooseaccount") ||
-			strings.Contains(url, "/consent") ||
-			strings.Contains(url, "/gaplustos") {
-			handleConsentScreen(page)
-			continue
-		}
-
-		// Debug: log URL periodically
-		if i%10 == 0 {
-			fmt.Fprintf(os.Stderr, "[redirect] t=%ds url=%s\n", i, url[:min(80, len(url))])
-		}
-
-		// Handle Google interstitial pages (TOS, speedbump, consent, oauth)
-		if strings.Contains(url, "accounts.google.com") {
-			if strings.Contains(url, "/speedbump/") ||
-				strings.Contains(url, "/termsofservice") ||
-				strings.Contains(url, "/consent") ||
-				strings.Contains(url, "/oauthchooseaccount") ||
-				strings.Contains(url, "/signin/oauth") ||
-				strings.Contains(url, "/gaplustos") {
-				handleConsentScreen(page)
-			}
-			continue
-		}
-
-		// Check if we're back on provider
-		if providerHost != "" && strings.Contains(url, providerHost) {
-			// For codebuddy: skip Keycloak broker/endpoint callbacks — wait for app page
-			if req.Provider == "codebuddy" && strings.Contains(url, "/auth/realms/copilot/broker/") {
-				continue
-			}
-			fmt.Fprintf(os.Stderr, "[redirect] landed on: %s\n", url[:min(100, len(url))])
-			return extractCookies(page, providerHost)
-		}
-	}
-
-	return nil, fmt.Errorf("timeout waiting for redirect to %s", providerHost)
-}
-
 func handleConsentScreen(page *rod.Page) {
 	randomDelay(500, 1500)
 
-	// Try clicking Allow/Continue/Accept buttons
 	selectors := []string{
 		`#submit_approve_access`,
 		`button[id="submit_approve_access"]`,
@@ -288,7 +208,6 @@ func handleConsentScreen(page *rod.Page) {
 		}
 	}
 
-	// Fallback: try any button/link with consent-related text
 	buttons, _ := page.Elements(`button, input[type="submit"], div[role="button"], a[role="button"], span[role="button"]`)
 	for _, btn := range buttons {
 		text, _ := btn.Text()
@@ -302,13 +221,12 @@ func handleConsentScreen(page *rod.Page) {
 			strings.Contains(lower, "confirm") ||
 			strings.Contains(lower, "proceed") {
 			humanClick(page, btn)
-			fmt.Fprintf(os.Stderr, "[consent] clicked: %s\n", lower[:min(40, len(lower))])
+			fmt.Fprintf(os.Stderr, "[consent] clicked: %s\n", lower[:minInt(40, len(lower))])
 			randomDelay(800, 1500)
 			return
 		}
 	}
 
-	// Last resort: try clicking any visible button on the page
 	allBtns, _ := page.Elements(`button`)
 	for _, btn := range allBtns {
 		visible, _ := btn.Visible()
@@ -323,18 +241,434 @@ func handleConsentScreen(page *rod.Page) {
 	fmt.Fprintf(os.Stderr, "[consent] no clickable button found\n")
 }
 
+func handleRegionSelection(page *rod.Page) error {
+	info, err := page.Info()
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(info.URL, "/register/user/complete") {
+		return nil
+	}
+
+	fmt.Fprintf(os.Stderr, "[region] completion page detected\n")
+	time.Sleep(3 * time.Second)
+
+	// ── STEP 1: Click the Registration location input to open t-popup dropdown ──
+	// The input is READONLY — clicking it opens a t-popup with country options.
+	// DO NOT type into it — that breaks the popup state.
+	opened := false
+
+	inputSelectors := []string{
+		`input[placeholder="Registration location"]`,
+		`input.t-input__inner`,
+		`.t-input input`,
+	}
+
+	for _, sel := range inputSelectors {
+		el, err := page.Timeout(8 * time.Second).Element(sel)
+		if err != nil {
+			continue
+		}
+		visible, _ := el.Visible()
+		if !visible {
+			continue
+		}
+
+		_ = el.ScrollIntoView()
+		time.Sleep(500 * time.Millisecond)
+
+		box, shapeErr := el.Shape()
+		if shapeErr != nil {
+			continue
+		}
+		b := box.Box()
+		x := b.X + b.Width/2
+		y := b.Y + b.Height/2
+
+		_ = page.Mouse.MustMoveTo(x, y)
+		time.Sleep(100 * time.Millisecond)
+		_ = page.Mouse.Down(proto.InputMouseButtonLeft, 1)
+		time.Sleep(50 * time.Millisecond)
+		_ = page.Mouse.Up(proto.InputMouseButtonLeft, 1)
+
+		opened = true
+		fmt.Fprintf(os.Stderr, "[region] clicked input (%s) at %.0f,%.0f\n", sel, x, y)
+		break
+	}
+
+	if !opened {
+		return fmt.Errorf("could not find/click Registration location input")
+	}
+
+	// Wait for t-popup to appear
+	time.Sleep(1500 * time.Millisecond)
+
+	// ── STEP 2: Find and click Singapore from the popup's <LI> list ──
+	// The popup structure is:
+	//   div.t-popup > div.t-popup__content >
+	//     div.dropdown-search (search input)
+	//     div (Current Region header + current selection)
+	//     ul.dropdown-section > li.cursor-pointer (country options)
+	//
+	// Singapore is an <LI> inside ul.dropdown-section
+	selected := false
+
+	sgResult, err := page.Eval(`() => {
+		// Look in the popup's option list — LI elements inside ul.dropdown-section
+		const items = document.querySelectorAll('ul.dropdown-section li, .t-popup__content li, .t-popup li');
+		for (const el of items) {
+			if (el.offsetParent === null) continue;
+			const txt = (el.textContent || '').trim();
+			if (txt === 'Singapore') {
+				const rect = el.getBoundingClientRect();
+				if (rect.width > 10 && rect.height > 10) {
+					return JSON.stringify({
+						found: true,
+						x: rect.x + rect.width / 2,
+						y: rect.y + rect.height / 2,
+						text: txt,
+					});
+				}
+			}
+		}
+		// Fallback: any visible element with exact text "Singapore" (not "Current Region Singapore")
+		const all = document.querySelectorAll('.t-popup__content *');
+		for (const el of all) {
+			if (el.offsetParent === null) continue;
+			const txt = (el.textContent || '').trim();
+			if (txt === 'Singapore' && el.children.length === 0) {
+				const rect = el.getBoundingClientRect();
+				if (rect.width > 10 && rect.height > 10) {
+					return JSON.stringify({
+						found: true,
+						x: rect.x + rect.width / 2,
+						y: rect.y + rect.height / 2,
+						text: txt,
+					});
+				}
+			}
+		}
+		// Debug: dump what's in the popup
+		const debug = [];
+		document.querySelectorAll('.t-popup__content *, ul.dropdown-section *').forEach(el => {
+			if (el.offsetParent !== null) {
+				debug.push(el.tagName + ':' + (el.textContent||'').trim().substring(0,40));
+			}
+		});
+		return JSON.stringify({ found: false, debug: debug.slice(0, 20) });
+	}`)
+
+	if err == nil && sgResult != nil {
+		raw := sgResult.Value.Str()
+		fmt.Fprintf(os.Stderr, "[region] singapore search: %s\n", raw[:minInt(300, len(raw))])
+
+		var parsed map[string]interface{}
+		if jsonErr := json.Unmarshal([]byte(raw), &parsed); jsonErr == nil {
+			if found, ok := parsed["found"].(bool); ok && found {
+				x := parsed["x"].(float64)
+				y := parsed["y"].(float64)
+				fmt.Fprintf(os.Stderr, "[region] clicking Singapore at %.0f,%.0f\n", x, y)
+
+				_ = page.Mouse.MustMoveTo(x, y)
+				time.Sleep(100 * time.Millisecond)
+				_ = page.Mouse.Down(proto.InputMouseButtonLeft, 1)
+				time.Sleep(50 * time.Millisecond)
+				_ = page.Mouse.Up(proto.InputMouseButtonLeft, 1)
+				selected = true
+			}
+		}
+	}
+
+	// Fallback: JS click on the LI directly
+	if !selected {
+		fmt.Fprintf(os.Stderr, "[region] mouse click failed, trying JS click on LI\n")
+		jsClick, err := page.Eval(`() => {
+			const items = document.querySelectorAll('ul.dropdown-section li, .t-popup__content li');
+			for (const el of items) {
+				if (el.offsetParent === null) continue;
+				const txt = (el.textContent || '').trim();
+				if (txt === 'Singapore') {
+					el.scrollIntoView({block: 'center'});
+					el.click();
+					return 'clicked';
+				}
+			}
+			return '';
+		}`)
+		if err == nil && jsClick != nil && jsClick.Value.Str() == "clicked" {
+			selected = true
+			fmt.Fprintf(os.Stderr, "[region] JS click on Singapore LI succeeded\n")
+		}
+	}
+
+	if !selected {
+		return fmt.Errorf("Singapore option not found in dropdown popup")
+	}
+
+	// Wait for selection to register and popup to close
+	time.Sleep(2 * time.Second)
+
+	// ── STEP 3: Verify Singapore is selected ──
+	fmt.Fprintf(os.Stderr, "[region] verifying selection...\n")
+	verified := false
+	for i := 0; i < 8; i++ {
+		time.Sleep(500 * time.Millisecond)
+		res, err := page.Eval(`() => {
+			const input = document.querySelector('input[placeholder="Registration location"]') ||
+			              document.querySelector('input.t-input__inner');
+			const val = (input?.value || '').trim().toLowerCase();
+			const body = (document.body?.innerText || '').toLowerCase();
+			return val === 'singapore' || body.includes('current region singapore');
+		}`)
+		if err == nil && res != nil && res.Value.Bool() {
+			verified = true
+			fmt.Fprintf(os.Stderr, "[region] ✓ Singapore confirmed\n")
+			break
+		}
+	}
+	if !verified {
+		fmt.Fprintf(os.Stderr, "[region] WARNING: could not verify Singapore selection, continuing anyway\n")
+	}
+
+	time.Sleep(1 * time.Second)
+
+	// ── STEP 4: Click Submit button ──
+	// Submit button appears AFTER region is selected.
+	// It's typically a button or div with text "Submit".
+	submitted := false
+
+	// Strategy 1: find via JS and click with real mouse
+	submitResult, err := page.Eval(`() => {
+		const all = document.querySelectorAll('button, [role="button"], div, span, a, input[type="submit"]');
+		for (const el of all) {
+			if (el.offsetParent === null) continue;
+			const txt = (el.textContent || '').trim();
+			if (/^submit$/i.test(txt)) {
+				const rect = el.getBoundingClientRect();
+				if (rect.width > 10 && rect.height > 10) {
+					return JSON.stringify({
+						found: true,
+						x: rect.x + rect.width / 2,
+						y: rect.y + rect.height / 2,
+						tag: el.tagName,
+						cls: (el.className || '').toString().substring(0, 60),
+					});
+				}
+			}
+		}
+		// Looser: contains "submit"
+		for (const el of all) {
+			if (el.offsetParent === null) continue;
+			const txt = (el.textContent || '').trim();
+			if (/submit/i.test(txt) && txt.length < 40) {
+				const rect = el.getBoundingClientRect();
+				if (rect.width > 10 && rect.height > 10) {
+					return JSON.stringify({
+						found: true,
+						x: rect.x + rect.width / 2,
+						y: rect.y + rect.height / 2,
+						tag: el.tagName,
+						cls: (el.className || '').toString().substring(0, 60),
+					});
+				}
+			}
+		}
+		// Debug: dump visible button-like elements
+		const btns = [];
+		document.querySelectorAll('button, [role="button"], div[class*="cursor"], div[class*="btn"]').forEach(el => {
+			if (el.offsetParent === null) return;
+			const txt = (el.textContent || '').trim();
+			if (txt.length > 0 && txt.length < 40) {
+				btns.push(el.tagName + ':' + txt);
+			}
+		});
+		return JSON.stringify({ found: false, buttons: btns.slice(0, 15) });
+	}`)
+
+	if err == nil && submitResult != nil {
+		raw := submitResult.Value.Str()
+		fmt.Fprintf(os.Stderr, "[region] submit search: %s\n", raw[:minInt(300, len(raw))])
+
+		var parsed map[string]interface{}
+		if jsonErr := json.Unmarshal([]byte(raw), &parsed); jsonErr == nil {
+			if found, ok := parsed["found"].(bool); ok && found {
+				x := parsed["x"].(float64)
+				y := parsed["y"].(float64)
+				fmt.Fprintf(os.Stderr, "[region] clicking submit at %.0f,%.0f\n", x, y)
+				_ = page.Mouse.MustMoveTo(x, y)
+				time.Sleep(100 * time.Millisecond)
+				_ = page.Mouse.Down(proto.InputMouseButtonLeft, 1)
+				time.Sleep(120 * time.Millisecond)
+				_ = page.Mouse.Up(proto.InputMouseButtonLeft, 1)
+				submitted = true
+			}
+		}
+	}
+
+	// Strategy 2: JS el.click() fallback
+	if !submitted {
+		fmt.Fprintf(os.Stderr, "[region] mouse submit failed, trying JS click\n")
+		jsClick, err := page.Eval(`() => {
+			const all = document.querySelectorAll('button, [role="button"], div, span, a');
+			for (const el of all) {
+				if (el.offsetParent === null) continue;
+				const txt = (el.textContent || '').trim();
+				if (/^submit$/i.test(txt) || (/submit/i.test(txt) && txt.length < 40)) {
+					el.scrollIntoView({block: 'center'});
+					el.click();
+					el.dispatchEvent(new MouseEvent('click', {bubbles: true}));
+					return 'clicked:' + el.tagName + ':' + txt.substring(0, 30);
+				}
+			}
+			return '';
+		}`)
+		if err == nil && jsClick != nil && jsClick.Value.Str() != "" {
+			fmt.Fprintf(os.Stderr, "[region] JS submit click: %s\n", jsClick.Value.Str())
+			submitted = true
+		}
+	}
+
+	// Strategy 3: XPath fallback
+	if !submitted {
+		xpaths := []string{
+			`//*[text()='Submit']`,
+			`//*[contains(text(),'Submit')]`,
+			`//html/body/div/div/div[3]/div/div/div[2]/div[2]`,
+		}
+		for _, xpath := range xpaths {
+			el, err := page.ElementX(xpath)
+			if err != nil || el == nil {
+				continue
+			}
+			visible, _ := el.Visible()
+			if !visible {
+				continue
+			}
+			box, shapeErr := el.Shape()
+			if shapeErr != nil {
+				continue
+			}
+			b := box.Box()
+			_ = page.Mouse.MustMoveTo(b.X+b.Width/2, b.Y+b.Height/2)
+			time.Sleep(100 * time.Millisecond)
+			_ = page.Mouse.Down(proto.InputMouseButtonLeft, 1)
+			time.Sleep(120 * time.Millisecond)
+			_ = page.Mouse.Up(proto.InputMouseButtonLeft, 1)
+			submitted = true
+			fmt.Fprintf(os.Stderr, "[region] submit via XPath: %s\n", xpath)
+			break
+		}
+	}
+
+	if !submitted {
+		htmlDump, _ := page.Eval(`() => document.body.innerHTML.substring(0, 3000)`)
+		if htmlDump != nil {
+			fmt.Fprintf(os.Stderr, "[region] page HTML:\n%s\n", htmlDump.Value.Str())
+		}
+		return fmt.Errorf("submit button not found")
+	}
+
+	fmt.Fprintf(os.Stderr, "[region] submit clicked, waiting for navigation\n")
+
+	// ── STEP 5: Wait for URL to leave /register/user/complete ──
+	for i := 0; i < 20; i++ {
+		time.Sleep(1 * time.Second)
+		info, err := page.Info()
+		if err != nil {
+			continue
+		}
+		if !strings.Contains(info.URL, "/register/user/complete") {
+			fmt.Fprintf(os.Stderr, "[region] ✓ navigated to: %s\n", info.URL[:minInt(120, len(info.URL))])
+			return nil
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "[region] WARNING: still on registration page after submit\n")
+	return nil
+}
+
+func waitForProviderRedirect(page *rod.Page, req LoginRequest) (map[string]string, error) {
+	providerHost := extractHost(req.TargetURL)
+	regionHandled := false
+
+	for i := 0; i < 90; i++ {
+		time.Sleep(1 * time.Second)
+
+		info, err := page.Info()
+		if err != nil {
+			continue
+		}
+		url := info.URL
+
+		// ← ADD THIS
+		fmt.Fprintf(os.Stderr, "[redirect] tick=%d url=%s\n", i, url[:minInt(120, len(url))])
+
+		if strings.Contains(url, "accounts.google.com") {
+			if strings.Contains(url, "/speedbump/") ||
+				strings.Contains(url, "/consent") ||
+				strings.Contains(url, "/oauthchooseaccount") ||
+				strings.Contains(url, "/gaplustos") {
+				handleConsentScreen(page)
+			}
+			continue
+		}
+
+		if providerHost != "" && strings.Contains(url, providerHost) {
+			if req.Provider == "codebuddy" &&
+				strings.Contains(url, "/auth/realms/copilot/broker/") {
+				continue
+			}
+
+			// Region page — either already on it, or on /login/select that will redirect to it
+			if req.Provider == "codebuddy" {
+				isRegionPage := strings.Contains(url, "/register/user/complete")
+				isPreRegionRedirect := strings.Contains(url, "/login/select") &&
+					strings.Contains(url, "register%2Fuser%2Fcomplete")
+
+				if isRegionPage || isPreRegionRedirect {
+					if isPreRegionRedirect && !isRegionPage {
+						// We're on /login/select with redirect_uri pointing to registration
+						// Wait for the actual navigation to happen
+						fmt.Fprintf(os.Stderr, "[redirect] on /login/select, waiting for redirect to registration page...\n")
+						time.Sleep(3 * time.Second)
+						// Re-check URL after wait
+						if newInfo, e := page.Info(); e == nil {
+							newURL := newInfo.URL
+							fmt.Fprintf(os.Stderr, "[redirect] after wait url=%s\n", newURL[:minInt(120, len(newURL))])
+							if strings.Contains(newURL, "/register/user/complete") {
+								isRegionPage = true
+							}
+						}
+					}
+					if isRegionPage && !regionHandled {
+						regionHandled = true
+						fmt.Fprintf(os.Stderr, "[redirect] entering region selection handler\n")
+						_ = handleRegionSelection(page)
+					}
+					continue // keep looping until URL leaves registration
+				}
+			}
+
+			fmt.Fprintf(os.Stderr, "[redirect] extracting cookies at url=%s\n", url[:minInt(120, len(url))])
+
+			wait := page.WaitRequestIdle(2*time.Second, nil, nil, nil)
+			wait()
+			return extractCookies(page, providerHost)
+		}
+	}
+
+	return nil, fmt.Errorf("timeout waiting for redirect to %s", providerHost)
+}
+
 func extractCookies(page *rod.Page, host string) (map[string]string, error) {
-	// Wait for page to fully load and set cookies after redirect chain
 	_ = page.Timeout(15 * time.Second).WaitLoad()
 	time.Sleep(3 * time.Second)
 
-	// Use CDP to get ALL cookies from the browser (all domains)
 	cookies, err := proto.StorageGetCookies{
 		BrowserContextID: "",
 	}.Call(page)
 
 	if err != nil {
-		// Fallback to page.Cookies
 		pageCookies, err2 := page.Cookies(nil)
 		if err2 != nil {
 			return nil, fmt.Errorf("failed to get cookies: %w (cdp: %w)", err2, err)
@@ -346,15 +680,13 @@ func extractCookies(page *rod.Page, host string) (map[string]string, error) {
 		return result, nil
 	}
 
-	// Filter cookies for provider domain
 	result := make(map[string]string)
 	for _, c := range cookies.Cookies {
-		if strings.Contains(c.Domain, host) || isTokenCookie(c.Name) {
+		if strings.HasSuffix(c.Domain, host) || isTokenCookie(c.Name) {
 			result[c.Name] = c.Value
 		}
 	}
 
-	// If no provider cookies, get all
 	if len(result) == 0 {
 		for _, c := range cookies.Cookies {
 			result[c.Name] = c.Value
@@ -365,7 +697,6 @@ func extractCookies(page *rod.Page, host string) (map[string]string, error) {
 		return result, fmt.Errorf("no cookies found after redirect to %s", host)
 	}
 
-	// Debug: show domains
 	domains := make(map[string]int)
 	for _, c := range cookies.Cookies {
 		domains[c.Domain]++
@@ -388,7 +719,6 @@ func isTokenCookie(name string) bool {
 }
 
 func extractHost(rawURL string) string {
-	// Simple host extraction
 	s := rawURL
 	if idx := strings.Index(s, "://"); idx >= 0 {
 		s = s[idx+3:]
@@ -396,11 +726,9 @@ func extractHost(rawURL string) string {
 	if idx := strings.IndexAny(s, "/?#"); idx >= 0 {
 		s = s[:idx]
 	}
-	// Remove port
 	if idx := strings.LastIndex(s, ":"); idx >= 0 {
 		s = s[:idx]
 	}
-	// Get main domain (last 2 parts)
 	parts := strings.Split(s, ".")
 	if len(parts) >= 2 {
 		return parts[len(parts)-2] + "." + parts[len(parts)-1]
@@ -408,18 +736,16 @@ func extractHost(rawURL string) string {
 	return s
 }
 
-// handleCodebuddyLanding handles the CodeBuddy login page:
-// The login form is inside an iframe (Keycloak). Strategy:
-//  1. Wait for iframe to load, extract its src URL
-//  2. Navigate the main page directly to the iframe URL (bypass iframe)
-//  3. Click "Log in" tab
-//  4. Click "Log in with Google" link
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func handleCodebuddyLanding(page *rod.Page) error {
-	// Wait for iframe to appear
 	time.Sleep(2 * time.Second)
 
-	// Step 1: Extract iframe src and navigate to it directly
-	// This avoids cross-frame issues — we make the iframe content the top-level page
 	iframeSrc := ""
 	for attempt := 0; attempt < 10; attempt++ {
 		result, err := page.Eval(`() => {
@@ -437,7 +763,7 @@ func handleCodebuddyLanding(page *rod.Page) error {
 	}
 
 	if iframeSrc != "" {
-		fmt.Fprintf(os.Stderr, "[codebuddy] navigating to iframe URL: %s\n", iframeSrc[:80])
+		fmt.Fprintf(os.Stderr, "[codebuddy] navigating to iframe URL: %s\n", iframeSrc[:minInt(80, len(iframeSrc))])
 		err := page.Navigate(iframeSrc)
 		if err != nil {
 			return fmt.Errorf("failed to navigate to iframe URL: %w", err)
@@ -448,7 +774,6 @@ func handleCodebuddyLanding(page *rod.Page) error {
 		fmt.Fprintf(os.Stderr, "[codebuddy] no iframe found, trying on current page\n")
 	}
 
-	// Step 2: Click "Log in" tab (page defaults to "Sign up")
 	tabClicked := false
 	for attempt := 0; attempt < 5; attempt++ {
 		result, err := page.Eval(`() => {
@@ -456,6 +781,8 @@ func handleCodebuddyLanding(page *rod.Page) error {
 			for (const el of els) {
 				const txt = (el.textContent || '').trim();
 				if (txt === 'Log in' && el.children.length === 0 && el.offsetParent !== null) {
+					el.dispatchEvent(new MouseEvent('mousedown', {bubbles:true}));
+					el.dispatchEvent(new MouseEvent('mouseup', {bubbles:true}));
 					el.click();
 					return true;
 				}
@@ -477,18 +804,14 @@ func handleCodebuddyLanding(page *rod.Page) error {
 
 	randomDelay(800, 1500)
 
-	// Step 3: Get Google login link href and navigate to it directly
-	// (clicking <a> via JS doesn't always trigger navigation in headless)
 	googleURL := ""
 	for attempt := 0; attempt < 8; attempt++ {
 		result, err := page.Eval(`() => {
-			// Primary: link with href containing /broker/google/login
 			for (const a of document.querySelectorAll('a[href*="/broker/google/login"]')) {
 				if (a.offsetParent !== null) {
 					return a.href;
 				}
 			}
-			// Fallback: any link with "google" text
 			const phrases = ['log in with google', 'sign in with google', 'sign up with google', 'continue with google'];
 			for (const el of document.querySelectorAll('a')) {
 				if (el.offsetParent === null) continue;
@@ -509,7 +832,6 @@ func handleCodebuddyLanding(page *rod.Page) error {
 	}
 
 	if googleURL == "" {
-		// Debug: dump what links exist
 		links, _ := page.Eval(`() => {
 			const result = [];
 			document.querySelectorAll('a').forEach(a => {
@@ -523,7 +845,7 @@ func handleCodebuddyLanding(page *rod.Page) error {
 		return fmt.Errorf("could not find Google login button on codebuddy page")
 	}
 
-	fmt.Fprintf(os.Stderr, "[codebuddy] navigating to Google broker: %s\n", googleURL[:min(80, len(googleURL))])
+	fmt.Fprintf(os.Stderr, "[codebuddy] navigating to Google broker: %s\n", googleURL[:minInt(80, len(googleURL))])
 	if err := page.Navigate(googleURL); err != nil {
 		return fmt.Errorf("failed to navigate to Google broker URL: %w", err)
 	}

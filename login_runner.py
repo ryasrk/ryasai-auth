@@ -257,10 +257,10 @@ async def _run_rod_login(
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-    # Always log stderr for debugging
+    # Always log stderr — rod region/redirect/consent logs are critical
     if stderr:
         for line in stderr.decode().strip().splitlines():
-            logger.debug("  [rod/%s] %s", provider, line)
+            logger.info("  [rod/%s] %s", provider, line)
 
     if proc.returncode != 0:
         err_msg = stderr.decode().strip() or f"rod exited with code {proc.returncode}"
