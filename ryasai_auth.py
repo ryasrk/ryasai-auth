@@ -640,6 +640,7 @@ async def retry(
     concurrent: int,
     headless: str,
     proxy_url: str,
+    browser_backend: str = "camoufox",
 ):
     """Retry all previously failed accounts from the local store.
 
@@ -760,7 +761,7 @@ async def main(args):
         logger.info("  Parallel:   %s", "⚡ YES" if settings.parallel else "🛡️ NO (sequential)")
         logger.info("  Concurrency: %d", concurrent)
         logger.info("")
-        await retry(providers if args.providers else None, concurrent, headless, proxy_url)
+        await retry(providers if args.providers else None, concurrent, headless, proxy_url, browser_backend)
         return
 
     # ── CONSUME MODE: no accounts file needed ────────────────────
